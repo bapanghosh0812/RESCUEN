@@ -1,7 +1,11 @@
 import firestore from '@react-native-firebase/firestore';
 import storage from '@react-native-firebase/storage';
-import AudioRecorderPlayer from 'react-native-nitro-sound'; 
+import AudioRecorderPlayer from 'react-native-nitro-sound';
+import ReactNativeBlobUtil from 'react-native-blob-util';
 import { Alert } from 'react-native';
+
+// Real writable cache directory for the on-device black-box recording.
+const CACHE_DIR = ReactNativeBlobUtil.fs.dirs.CacheDir;
 
 class SecureVaultManager {
   static currentSosId = null;
@@ -19,7 +23,9 @@ class SecureVaultManager {
   static async startAudioEvidence(uid) {
     if (this.isRecordingAudio) return;
     this.currentSosId = this.currentSosId || this.generateSosSessionId();
-    this.currentAudioPath = `${storage.TaskState.CACHE}/blackbox_audio_${this.currentSosId}.mp3`;
+    // FIXED: `storage.TaskState.CACHE` is an upload-state enum, not a path — the
+    // recorder was being handed an invalid destination and failing silently.
+    this.currentAudioPath = `${CACHE_DIR}/blackbox_audio_${this.currentSosId}.mp3`;
 
     try {
       await this.audioRecorder.startRecorder(this.currentAudioPath);
@@ -63,11 +69,13 @@ class SecureVaultManager {
     }
   }
 
-  // --- 4. End-to-End Encrypted Storage Upload ---
+  // --- 4. Secure Storage Upload ---
+  // NOTE: Firebase Storage encrypts data in transit (TLS) and at rest, and
+  // storage.rules make this path write-only from clients. This is NOT
+  // end-to-end encryption — don't market it as such.
   static async uploadEvidenceChunk(uid, localPath, type) {
     if (!uid || !localPath) return;
-    
-    // Directory structure: Only the owner can read this path in Firebase Rules
+
     const storagePath = `users/${uid}/evidence_vault/${this.currentSosId}/${Date.now()}_${type}`;
     const reference = storage().ref(storagePath);
 
@@ -105,7 +113,7 @@ class SecureVaultManager {
         latitude: locationCoords.latitude,
         longitude: locationCoords.longitude
       } : 'No Location Provided',
-      evidenceFolderLink: sessionId !== 'MANUAL_REPORT' ? `users/${user.uid}/evidence_vault/${sessionId}` : 'No Automated Evidence',
+      evidenceFolderLink: sessionId !== 'MANUAL_REPORT' ? `users/${user.email}/evidence_vault/${sessionId}` : 'No Automated Evidence',
       status: 'SECURED_IN_VAULT',
       timestamp: firestore.FieldValue.serverTimestamp(),
     };

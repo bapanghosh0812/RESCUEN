@@ -1,2 +1,8 @@
 node_modules/
 *.local
+
+# Secrets & local params — NEVER commit these.
+.env
+.env.*
+!.env.example
+.runtimeconfig.json

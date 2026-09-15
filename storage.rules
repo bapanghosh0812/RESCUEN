@@ -1,0 +1,29 @@
+rules_version = '2';
+
+// RESCUEN Cloud Storage security rules.
+//
+// The evidence vault holds the most sensitive data in the app — audio and
+// AI-captured photos recorded during an active SOS. Devices may UPLOAD their
+// own evidence, but NOTHING can be read back from a client. Retrieval is only
+// possible through the trusted backend (Admin SDK) or the Firebase console.
+// This is what "evidence is handled securely" must actually mean.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    match /users/{userId}/evidence_vault/{allPaths=**} {
+      allow write: if isSignedIn()
+                   && request.resource.size < 50 * 1024 * 1024; // 50 MB cap per object
+      allow read: if false;
+    }
+
+    // Default deny for everything else.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

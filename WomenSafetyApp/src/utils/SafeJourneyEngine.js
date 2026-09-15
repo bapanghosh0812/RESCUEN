@@ -78,7 +78,10 @@ class SafeJourneyEngine {
   // 4. "Are You Safe?" Full-Screen Lock Wake-up
   static async triggerAreYouSafeWarning() {
     this.isWarningActive = true;
-    
+    // Tell the app to show an in-app "Are you safe?" prompt so the user always
+    // has a way to cancel before the 30s auto-SOS (prevents false alarms).
+    try { DeviceEventEmitter.emit('ShowSafeCheck'); } catch (e) {}
+
     const channelId = await notifee.createChannel({
       id: 'are_you_safe_alert',
       name: 'Are You Safe Alerts',

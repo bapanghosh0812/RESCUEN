@@ -57,6 +57,18 @@ const encodeGeohash = (latitude, longitude, precision = 9) => {
   return hash;
 };
 
+// Only these fields are safe to broadcast into `active_emergencies`, which
+// nearby users can read. NEVER include familyNumbers, familyNum, fcmToken or
+// lastNumberUpdate — those are private and must stay in the owner's user doc.
+const sanitizeUserForBroadcast = (u = {}) => ({
+  name: u.name || '',
+  email: u.email || '',
+  myPhone: u.myPhone || '',
+  gender: u.gender || '',
+});
+
+const formatCallTime = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+
 try {
   notifee.registerForegroundService((notification) => {
     return new Promise((resolve) => {
@@ -193,6 +205,10 @@ const MainApp = () => {
   const [currentLocationText, setCurrentLocationText] = useState('🛰️ Locating Safe Server...');
   const [currentCoords, setCurrentCoords] = useState(null); 
   const [isSOSActive, setIsSOSActive] = useState(false);
+  const [isFollowMe, setIsFollowMe] = useState(false);
+  const [showSafeCheck, setShowSafeCheck] = useState(false);
+  const [fakeCallState, setFakeCallState] = useState('none'); // 'none' | 'incoming' | 'active'
+  const [fakeCallSecs, setFakeCallSecs] = useState(0);
   
   const [queryPrefix, setQueryPrefix] = useState(null);
   const [rawEmergencies, setRawEmergencies] = useState([]);
@@ -225,6 +241,7 @@ const MainApp = () => {
 
   const sirenSound = useRef(null);
   const mapRef = useRef(null);
+  const lastCoordsRef = useRef(null); // freshest known location, for SOS fallback
   const [ignoredEmergencies, setIgnoredEmergencies] = useState([]);
 
   const [isHelperRegistered, setIsHelperRegistered] = useState(false);
@@ -239,6 +256,7 @@ const MainApp = () => {
   const [loginPhaseIdx, setLoginPhaseIdx] = useState(0);
   const [displayedText, setDisplayedText] = useState('');
   const dotAnimY = useRef(new Animated.Value(0)).current;
+  const sosPulse = useRef(new Animated.Value(0)).current; // radar-ping ring behind SOS
 
   const loginPhrases = [
     { text: "Let's create", bg: "#e6f4ea", dot: "#34a853", txtColor: "#000" },
@@ -345,7 +363,44 @@ const MainApp = () => {
         triggerSOS();
     });
     return () => subscription.remove();
-  }, [currentCoords, user]); 
+  }, [currentCoords, user]);
+
+  // Follow-Me "Are you safe?" in-app prompt so the auto-SOS can always be cancelled.
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('ShowSafeCheck', () => setShowSafeCheck(true));
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => { if (isSOSActive) setShowSafeCheck(false); }, [isSOSActive]);
+
+  // Fake Call: ring with vibration while incoming; count up while active.
+  useEffect(() => {
+    let timer;
+    if (fakeCallState === 'incoming') {
+      try { Vibration.vibrate([0, 1000, 2000], true); } catch (e) {}
+    } else if (fakeCallState === 'active') {
+      try { Vibration.cancel(); } catch (e) {}
+      setFakeCallSecs(0);
+      timer = setInterval(() => setFakeCallSecs(s => s + 1), 1000);
+    } else {
+      try { Vibration.cancel(); } catch (e) {}
+    }
+    return () => { if (timer) clearInterval(timer); };
+  }, [fakeCallState]);
+
+  const toggleFollowMe = async () => {
+    try {
+      if (isFollowMe) {
+        await SafeJourneyEngine.stopTracking();
+        setIsFollowMe(false);
+        setShowSafeCheck(false);
+      } else {
+        await SafeJourneyEngine.startTracking();
+        setIsFollowMe(true);
+        Alert.alert("🛡️ Follow-Me Active", "RESCUEN is guarding your journey. If you stay stopped unexpectedly, we'll check on you — and auto-trigger SOS if you don't respond.");
+      }
+    } catch (e) { console.log(e); }
+  };
 
   useEffect(() => {
     const unsubscribe = messaging().onMessage(async remoteMessage => {
@@ -454,6 +509,17 @@ const MainApp = () => {
     return () => { subscription.remove(); };
   }, [currentScreen]);
 
+  // Gentle radar-ping loop behind the SOS button (only while it's on screen).
+  useEffect(() => {
+    let loop;
+    if (currentScreen === 'Dashboard' && hasAllTheTimePermission && !isSOSActive) {
+      sosPulse.setValue(0);
+      loop = Animated.loop(Animated.timing(sosPulse, { toValue: 1, duration: 1600, useNativeDriver: true }));
+      loop.start();
+    }
+    return () => { if (loop) { try { loop.stop(); } catch (e) {} } };
+  }, [currentScreen, hasAllTheTimePermission, isSOSActive]);
+
   const checkAndRequestLocation = async () => {
     try {
       let fineLoc = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
@@ -522,8 +588,17 @@ const MainApp = () => {
   };
 
   useEffect(() => {
+    if (currentCoords) lastCoordsRef.current = currentCoords;
     if (currentCoords && user && user.email) {
        const hash = encodeGeohash(currentCoords.latitude, currentCoords.longitude);
+       // Publish location to `presence` (no phone/family/token — safe for nearby
+       // users to read for the radar) and mirror to the user doc for backward
+       // compatibility during the migration.
+       firestore().collection('presence').doc(user.email).set({
+         email: user.email, name: user.name || '', gender: user.gender || '',
+         h: hash, lastKnownLocation: currentCoords,
+         updatedAt: firestore.FieldValue.serverTimestamp(),
+       }, { merge: true }).catch(() => {});
        firestore().collection('users').doc(user.email).update({ lastKnownLocation: currentCoords, h: hash }).catch(() => {});
     }
   }, [currentCoords, user.email]);
@@ -540,9 +615,9 @@ const MainApp = () => {
           setCurrentCoords(loc); 
           const hash = encodeGeohash(loc.latitude, loc.longitude);
           firestore().collection('active_emergencies').doc(user.email).set({
-            location: loc, 
+            location: loc,
             l: new firestore.GeoPoint(loc.latitude, loc.longitude),
-            h: hash, user: user, timestamp: firestore.FieldValue.serverTimestamp()
+            h: hash, user: sanitizeUserForBroadcast(user), timestamp: firestore.FieldValue.serverTimestamp()
           }, { merge: true }).catch(()=>{});
         },
         (err) => {}, { enableHighAccuracy: true, distanceFilter: 20, interval: 5000, fastestInterval: 2000 }
@@ -562,7 +637,7 @@ const MainApp = () => {
         });
 
       if (queryPrefix) {
-        victimMapListener = firestore().collection('users')
+        victimMapListener = firestore().collection('presence')
           .orderBy('h').startAt(queryPrefix).endAt(queryPrefix + '\uf8ff')
           .onSnapshot(snap => {
             try {
@@ -697,16 +772,34 @@ const MainApp = () => {
 
   const handleTCProceed = async () => { setCurrentScreen('ProfileSetup'); };
 
+  // Prefer LINKING the phone to the already-signed-in Google account so the
+  // session keeps its stable uid + email identity (this is what lets the backend
+  // and security rules bind data to a real owner). If linking isn't possible
+  // (no current user, or the number is already linked elsewhere), fall back to
+  // standard phone sign-in so OTP verification never breaks.
+  const requestPhoneCode = async () => {
+    const phoneNumber = '+91' + user.myPhone;
+    const currentUser = auth().currentUser;
+    if (currentUser) {
+      try {
+        return await currentUser.linkWithPhoneNumber(phoneNumber);
+      } catch (linkErr) {
+        console.log('linkWithPhoneNumber fallback:', linkErr?.code || linkErr);
+      }
+    }
+    return await auth().signInWithPhoneNumber(phoneNumber);
+  };
+
   const sendOTP = async () => {
     if (user.myPhone.length !== 10) return Alert.alert("Validation", "Enter a valid 10-digit number.");
-    if (isSendingOtp || isOtpSent) return; 
+    if (isSendingOtp || isOtpSent) return;
     setIsSendingOtp(true);
     try {
-      const confirmation = await auth().signInWithPhoneNumber('+91' + user.myPhone);
+      const confirmation = await requestPhoneCode();
       setConfirmResult(confirmation);
-      setIsOtpSent(true); setOtpTimer(60); 
+      setIsOtpSent(true); setOtpTimer(60);
       Alert.alert("OTP Sent", "Check your messages.");
-    } catch (error) { Alert.alert("Error", String(error.message)); } 
+    } catch (error) { Alert.alert("Error", String(error.message)); }
     finally { setIsSendingOtp(false); }
   };
 
@@ -714,10 +807,10 @@ const MainApp = () => {
     if (otpTimer > 0) return;
     setIsSendingOtp(true); setOtpCode(''); isVerifyingRef.current = false;
     try {
-      const confirmation = await auth().signInWithPhoneNumber('+91' + user.myPhone);
-      setConfirmResult(confirmation); setOtpTimer(60); 
+      const confirmation = await requestPhoneCode();
+      setConfirmResult(confirmation); setOtpTimer(60);
       Alert.alert("OTP Resent", "A new OTP has been sent.");
-    } catch (error) { Alert.alert("Error", String(error.message)); } 
+    } catch (error) { Alert.alert("Error", String(error.message)); }
     finally { setIsSendingOtp(false); }
   };
 
@@ -799,6 +892,12 @@ const MainApp = () => {
       if(currentCoords) finalData.lastKnownLocation = currentCoords;
       
       await firestore().collection('users').doc(finalEmail).set(finalData);
+      // Publish safe presence (no phone/family) for the nearby radar.
+      await firestore().collection('presence').doc(finalEmail).set({
+        email: finalEmail, name: finalName, gender: user.gender || '',
+        h: hash, ...(currentCoords ? { lastKnownLocation: currentCoords } : {}),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
+      }, { merge: true }).catch(() => {});
       await AsyncStorage.setItem('userSession', JSON.stringify(finalData));
       await AsyncStorage.removeItem('safe_reg_email');
       await AsyncStorage.removeItem('safe_reg_name');
@@ -877,17 +976,31 @@ const MainApp = () => {
       // 🔥 START SECURE VAULT RECORDING (PHASE 3)
       if (SecureVaultManager) SecureVaultManager.startAudioEvidence(user.email);
 
-      if (currentCoords && user && user.email) {
-        const hash = encodeGeohash(currentCoords.latitude, currentCoords.longitude);
-        firestore().collection('active_emergencies').doc(user.email).set({
-          location: currentCoords, l: new firestore.GeoPoint(currentCoords.latitude, currentCoords.longitude),
-          h: hash, user: user, timestamp: firestore.FieldValue.serverTimestamp(), notifiedUsers: [], activeHelpers: []
-        }, { merge: true }).catch(()=>{});
+      // Use freshest location; fall back to last known so an SOS is never lost
+      // just because GPS hasn't re-locked at the moment of the trigger.
+      const coords = currentCoords || lastCoordsRef.current;
+
+      if (coords && user && user.email) {
+        const hash = encodeGeohash(coords.latitude, coords.longitude);
+        const emergencyDoc = {
+          location: coords, l: new firestore.GeoPoint(coords.latitude, coords.longitude),
+          h: hash, user: sanitizeUserForBroadcast(user),
+          timestamp: firestore.FieldValue.serverTimestamp(), notifiedUsers: [], activeHelpers: [],
+        };
+        // Critical write — this is what fires the community broadcast + server
+        // SMS. Retry across transient network failures instead of silently
+        // swallowing them (the device SMS below is an independent backup).
+        const ref = firestore().collection('active_emergencies').doc(user.email);
+        let written = false;
+        for (let attempt = 0; attempt < 3 && !written; attempt++) {
+          try { await ref.set(emergencyDoc, { merge: true }); written = true; }
+          catch (e) { await new Promise(r => setTimeout(r, 800 * (attempt + 1))); }
+        }
       }
 
-      const lat = currentCoords ? currentCoords.latitude : 0;
-      const lng = currentCoords ? currentCoords.longitude : 0;
-      const mapLink = currentCoords ? `http://maps.google.com/?q=${lat},${lng}` : 'Location Unavailable';
+      const lat = coords ? coords.latitude : 0;
+      const lng = coords ? coords.longitude : 0;
+      const mapLink = coords ? `https://maps.google.com/?q=${lat},${lng}` : 'Location Unavailable';
       const smsBody = `URGENT EMERGENCY: I am ${user.name}. I am in severe danger. Track me: ${mapLink}`;
 
       try {
@@ -1369,9 +1482,22 @@ const MainApp = () => {
                       </View>
                    </View>
                    
-                   <TouchableOpacity style={styles.panicBtn} onLongPress={triggerSOS} delayLongPress={2000}>
-                      <Text style={styles.panicText}>SOS</Text>
+                   <TouchableOpacity style={[styles.followBtn, isFollowMe && styles.followBtnActive]} onPress={toggleFollowMe} activeOpacity={0.85}>
+                     <Text style={[styles.followBtnText, isFollowMe && { color: '#fff' }]}>
+                       {isFollowMe ? '🛡️  FOLLOW-ME: ON — tap to stop' : '🧭  START FOLLOW-ME (guard my journey)'}
+                     </Text>
                    </TouchableOpacity>
+
+                   <View style={styles.panicWrap}>
+                     <Animated.View pointerEvents="none" style={[styles.panicPulse, {
+                        opacity: sosPulse.interpolate({ inputRange: [0, 1], outputRange: [0.45, 0] }),
+                        transform: [{ scale: sosPulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.6] }) }],
+                     }]} />
+                     <TouchableOpacity style={styles.panicBtn} onLongPress={triggerSOS} delayLongPress={2000} activeOpacity={0.85}>
+                        <Text style={styles.panicText}>SOS</Text>
+                        <Text style={styles.panicHint}>HOLD</Text>
+                     </TouchableOpacity>
+                   </View>
                    <Text style={styles.instruction}>HOLD BUTTON FOR 2 SECONDS IN DANGER</Text>
                  </>
                )}
@@ -1393,6 +1519,24 @@ const MainApp = () => {
                    <Text style={{color: '#fff', fontWeight: '900', fontSize: 14}}>🚨 REPORT ISSUE / CONTACT SUPPORT</Text>
                  </TouchableOpacity>
               </View>
+
+              {/* Emergency helplines — always one tap away */}
+              <View style={styles.helplineRow}>
+                {[
+                  { label: '🚨 Emergency', num: '112' },
+                  { label: '👩 Women', num: '1091' },
+                  { label: '🚑 Ambulance', num: '108' },
+                ].map(h => (
+                  <TouchableOpacity key={h.num} style={styles.helplineBtn} onPress={() => Linking.openURL(`tel:${h.num}`)}>
+                    <Text style={styles.helplineLabel}>{h.label}</Text>
+                    <Text style={styles.helplineNum}>{h.num}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <TouchableOpacity style={styles.fakeCallBtn} onPress={() => setFakeCallState('incoming')} activeOpacity={0.85}>
+                <Text style={styles.fakeCallBtnText}>📞  Fake Call — escape an unsafe moment</Text>
+              </TouchableOpacity>
 
               {showAIChips && (
                 <View style={styles.flipkartGridContainer}>
@@ -1476,13 +1620,13 @@ const MainApp = () => {
 
       {(currentScreen === 'Dashboard' || currentScreen === 'ProfileView' || currentScreen === 'AIHelp') && (
         <View style={styles.footer}>
-          <TouchableOpacity style={styles.tab} onPress={() => setCurrentScreen('Dashboard')}>
+          <TouchableOpacity style={[styles.tab, currentScreen==='Dashboard' && styles.tabActive]} onPress={() => setCurrentScreen('Dashboard')}>
             <Text style={[styles.tabText, currentScreen==='Dashboard' && {color:'#004aad'}]}>🏠 HOME</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.tab} onPress={() => setCurrentScreen('AIHelp')}>
+          <TouchableOpacity style={[styles.tab, currentScreen==='AIHelp' && styles.tabActive]} onPress={() => setCurrentScreen('AIHelp')}>
             <Text style={[styles.tabText, currentScreen==='AIHelp' && {color:'#004aad'}]}>🤖 AI HELP</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.tab} onPress={() => setCurrentScreen('ProfileView')}>
+          <TouchableOpacity style={[styles.tab, currentScreen==='ProfileView' && styles.tabActive]} onPress={() => setCurrentScreen('ProfileView')}>
             <Text style={[styles.tabText, currentScreen==='ProfileView' && {color:'#004aad'}]}>👤 PROFILE</Text>
           </TouchableOpacity>
 
@@ -1712,6 +1856,59 @@ const MainApp = () => {
         </View>
       </Modal>
 
+      {/* Follow-Me "Are you safe?" prompt — always lets the user cancel the auto-SOS */}
+      <Modal visible={showSafeCheck && !isSOSActive} transparent animationType="fade">
+        <View style={[styles.modalBg, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+          <View style={[styles.card, { width: '90%', borderColor: '#e74c3c', borderWidth: 2 }]}>
+            <Text style={{ fontSize: 24, fontWeight: '900', color: '#e74c3c', textAlign: 'center', marginBottom: 10 }}>⚠️ ARE YOU SAFE?</Text>
+            <Text style={{ fontSize: 15, color: '#333', textAlign: 'center', marginBottom: 20, lineHeight: 22, fontWeight: 'bold' }}>
+              You've been stopped for a while. Tap "I'M SAFE" now — otherwise RESCUEN will auto-trigger SOS to keep you protected.
+            </Text>
+            <TouchableOpacity
+              style={[styles.btn, { backgroundColor: '#2ecc71', height: 60 }]}
+              onPress={() => { try { SafeJourneyEngine.dismissWarning(); } catch (e) {} setShowSafeCheck(false); }}
+            >
+              <Text style={styles.btnText}>✅ I'M SAFE</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.btn, { backgroundColor: '#e74c3c', marginTop: 12 }]}
+              onPress={() => { try { SafeJourneyEngine.dismissWarning(); } catch (e) {} setShowSafeCheck(false); triggerSOS(); }}
+            >
+              <Text style={styles.btnText}>🚨 I NEED HELP NOW</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Fake Call — a decoy incoming call to exit an unsafe situation */}
+      <Modal visible={fakeCallState !== 'none'} animationType="slide" onRequestClose={() => setFakeCallState('none')}>
+        <View style={styles.callScreen}>
+          <View style={{ alignItems: 'center', marginTop: 80 }}>
+            <View style={styles.callAvatar}><Text style={{ fontSize: 52 }}>👩</Text></View>
+            <Text style={styles.callName}>Mom</Text>
+            <Text style={styles.callStatus}>
+              {fakeCallState === 'incoming' ? 'Incoming call…' : `Ongoing   ${formatCallTime(fakeCallSecs)}`}
+            </Text>
+          </View>
+          <View style={styles.callActions}>
+            {fakeCallState === 'incoming' ? (
+              <>
+                <TouchableOpacity style={[styles.callCircle, { backgroundColor: '#e74c3c' }]} onPress={() => setFakeCallState('none')}>
+                  <Text style={styles.callCircleIcon}>✕</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.callCircle, { backgroundColor: '#2ecc71' }]} onPress={() => setFakeCallState('active')}>
+                  <Text style={styles.callCircleIcon}>📞</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <TouchableOpacity style={[styles.callCircle, { backgroundColor: '#e74c3c' }]} onPress={() => setFakeCallState('none')}>
+                <Text style={styles.callCircleIcon}>✕</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+      </Modal>
+
       {/* 🔥 THE PREMIUM REPORT FORM MODAL 🔥 */}
       <Modal visible={showReportForm} transparent animationType="slide">
         <View style={[styles.modalBg, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
@@ -1813,7 +2010,7 @@ const MainApp = () => {
 
 const styles = StyleSheet.create({
   main: { flex: 1, backgroundColor: '#ffffff' }, 
-  header: { height: 70, backgroundColor: '#ffffff', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, elevation: 5, zIndex: 10, width: '100%' },
+  header: { height: 72, backgroundColor: '#ffffff', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, elevation: 6, zIndex: 10, width: '100%', shadowColor: '#0a2540', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.10, shadowRadius: 10, borderBottomWidth: 0.5, borderBottomColor: '#eef1f5' },
   logo: { width: 40, height: 40, marginRight: 15, borderRadius: 5 },
   headerTitle: { fontSize: 24, fontWeight: '900', color: '#004aad', letterSpacing: 1 },
   headerIconsContainer: { flex: 1, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center' },
@@ -1822,7 +2019,7 @@ const styles = StyleSheet.create({
   centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 100 }, 
   warningBox: { width: '100%', backgroundColor: '#ffeaa7', padding: 15, borderRadius: 10, borderWidth: 1, borderColor: '#f1c40f', marginBottom: 20, alignItems: 'center' },
   warningText: { color: '#d35400', fontWeight: 'bold', textAlign: 'center', fontSize: 13, lineHeight: 20 },
-  card: { backgroundColor: '#ffffff', padding: 25, borderRadius: 20, elevation: 4 },
+  card: { backgroundColor: '#ffffff', padding: 25, borderRadius: 22, elevation: 5, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.08, shadowRadius: 18 },
   cardTitle: { fontSize: 26, fontWeight: '800', marginBottom: 5, color: '#000000' },
   label: { fontSize: 12, color: '#555555', marginBottom: 8, fontWeight: 'bold', marginTop: 10 }, 
   input: { backgroundColor: '#ffffff', height: 55, borderRadius: 12, paddingHorizontal: 20, borderWidth: 1, borderColor: '#cccccc', marginBottom: 15, fontSize: 15, color: '#000000', fontWeight: 'bold' },
@@ -1830,7 +2027,7 @@ const styles = StyleSheet.create({
   gBtn: { flex: 1, padding: 15, borderWidth: 1, borderColor: '#cccccc', borderRadius: 12, alignItems: 'center', marginHorizontal: 4, backgroundColor: '#ffffff' },
   gActive: { backgroundColor: '#004aad', borderColor: '#004aad' },
   gText: { fontWeight: 'bold', color: '#333333' }, 
-  btn: { backgroundColor: '#004aad', padding: 18, borderRadius: 12, alignItems: 'center', elevation: 2, marginTop: 10 },
+  btn: { backgroundColor: '#004aad', padding: 18, borderRadius: 14, alignItems: 'center', elevation: 3, marginTop: 10, shadowColor: '#004aad', shadowOffset: { width: 0, height: 5 }, shadowOpacity: 0.28, shadowRadius: 10 },
   btnText: { color: '#ffffff', fontSize: 16, fontWeight: '800', letterSpacing: 1 },
   tcBox: { height: 180, backgroundColor: '#f9f9f9', padding: 15, borderRadius: 12, marginBottom: 20, borderWidth: 1.5, borderColor: '#eeeeee' },
   tcText: { fontSize: 13, color: '#333333', lineHeight: 22 },
@@ -1839,15 +2036,31 @@ const styles = StyleSheet.create({
   checked: { backgroundColor: '#004aad' },
   checkLabel: { fontSize: 13, fontWeight: 'bold', color: '#004aad' },
   sosContainer: { alignItems: 'center', marginTop: 20, backgroundColor: '#f4f7f6', flex: 1 },
-  mapBox: { width: '100%', padding: 20, backgroundColor: '#ffffff', borderRadius: 15, marginBottom: 30, alignItems: 'center', elevation: 3, borderWidth: 1, borderColor: '#e1e5eb' },
+  mapBox: { width: '100%', padding: 20, backgroundColor: '#ffffff', borderRadius: 18, marginBottom: 26, alignItems: 'center', elevation: 4, borderWidth: 1, borderColor: '#eef1f5', shadowColor: '#0a2540', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.08, shadowRadius: 14 },
   mapText: { fontSize: 18, fontWeight: 'bold', color: '#2ecc71' },
   locationSubText: { fontSize: 13, color: '#000000', marginTop: 8, fontWeight: 'bold', textAlign: 'center' },
-  panicBtn: { backgroundColor: '#e74c3c', width: 240, height: 240, borderRadius: 120, justifyContent: 'center', alignItems: 'center', elevation: 20, borderWidth: 10, borderColor: 'rgba(231, 76, 60, 0.2)' },
+  panicWrap: { justifyContent: 'center', alignItems: 'center', marginTop: 10 },
+  panicPulse: { position: 'absolute', width: 240, height: 240, borderRadius: 120, backgroundColor: '#e74c3c' },
+  panicBtn: { backgroundColor: '#e74c3c', width: 240, height: 240, borderRadius: 120, justifyContent: 'center', alignItems: 'center', elevation: 20, borderWidth: 10, borderColor: 'rgba(231, 76, 60, 0.25)', shadowColor: '#e74c3c', shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.5, shadowRadius: 24 },
   panicText: { color: '#ffffff', fontSize: 60, fontWeight: '900', letterSpacing: 2 },
+  panicHint: { color: 'rgba(255,255,255,0.9)', fontSize: 14, fontWeight: '800', letterSpacing: 3, marginTop: 2 },
+  followBtn: { width: '100%', backgroundColor: '#ffffff', borderWidth: 1.5, borderColor: '#004aad', borderRadius: 14, paddingVertical: 15, alignItems: 'center', marginBottom: 24, elevation: 2 },
+  followBtnActive: { backgroundColor: '#004aad', borderColor: '#004aad' },
+  followBtnText: { color: '#004aad', fontWeight: '800', fontSize: 14, letterSpacing: 0.5 },
+  fakeCallBtn: { backgroundColor: '#2c3e50', borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginBottom: 18, marginHorizontal: 5, elevation: 2 },
+  fakeCallBtnText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
+  callScreen: { flex: 1, backgroundColor: '#111417', justifyContent: 'space-between', paddingVertical: 60 },
+  callAvatar: { width: 120, height: 120, borderRadius: 60, backgroundColor: '#2c3e50', justifyContent: 'center', alignItems: 'center', marginBottom: 20 },
+  callName: { color: '#ffffff', fontSize: 32, fontWeight: '800' },
+  callStatus: { color: '#bdc3c7', fontSize: 16, marginTop: 8 },
+  callActions: { flexDirection: 'row', justifyContent: 'space-evenly', alignItems: 'center', marginBottom: 40 },
+  callCircle: { width: 74, height: 74, borderRadius: 37, justifyContent: 'center', alignItems: 'center', elevation: 6 },
+  callCircleIcon: { color: '#ffffff', fontSize: 30 },
   instruction: { marginTop: 30, color: '#444444', fontWeight: 'bold', letterSpacing: 1, textAlign: 'center' },
-  footer: { height: 70, backgroundColor: '#ffffff', flexDirection: 'row', borderTopWidth: 1, borderColor: '#eeeeee' },
-  tab: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  tabText: { fontSize: 13, fontWeight: 'bold', color: '#888888' },
+  footer: { height: 72, backgroundColor: '#ffffff', flexDirection: 'row', borderTopWidth: 0.5, borderColor: '#eef1f5', elevation: 12, shadowColor: '#0a2540', shadowOffset: { width: 0, height: -3 }, shadowOpacity: 0.06, shadowRadius: 10 },
+  tab: { flex: 1, justifyContent: 'center', alignItems: 'center', borderTopWidth: 3, borderTopColor: 'transparent' },
+  tabActive: { backgroundColor: '#eef3ff', borderTopColor: '#004aad' },
+  tabText: { fontSize: 13, fontWeight: 'bold', color: '#8a94a6' },
   profileRow: { borderBottomWidth: 1, borderColor: '#eeeeee', paddingVertical: 15, flexDirection: 'row', justifyContent: 'space-between' },
   profileLabel: { color: '#888888', fontWeight: 'bold', fontSize: 13 },
   profileValue: { color: '#000000', fontWeight: 'bold', fontSize: 15 },
@@ -1866,8 +2079,12 @@ const styles = StyleSheet.create({
   chatInput: { flex: 1, backgroundColor: '#f4f7f6', borderRadius: 25, paddingHorizontal: 20, height: 50, color: '#000', fontWeight: 'bold' },
   chatSendBtn: { backgroundColor: '#004aad', borderRadius: 25, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20, marginLeft: 10 },
   flipkartGridContainer: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginBottom: 20, paddingHorizontal: 5 },
-  flipkartGridBox: { width: '48%', backgroundColor: '#ffffff', borderWidth: 1, borderColor: '#004aad', borderRadius: 12, paddingVertical: 18, alignItems: 'center', justifyContent: 'center', marginBottom: 10, elevation: 2 },
+  flipkartGridBox: { width: '48%', backgroundColor: '#ffffff', borderWidth: 1, borderColor: '#dbe4f3', borderRadius: 14, paddingVertical: 18, alignItems: 'center', justifyContent: 'center', marginBottom: 10, elevation: 2, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.06, shadowRadius: 8 },
   flipkartGridText: { color: '#004aad', fontWeight: 'bold', fontSize: 14, textAlign: 'center' },
+  helplineRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 18, paddingHorizontal: 5 },
+  helplineBtn: { flex: 1, backgroundColor: '#fff5f5', borderWidth: 1.5, borderColor: '#e74c3c', borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginHorizontal: 4, elevation: 2 },
+  helplineLabel: { color: '#c0392b', fontWeight: 'bold', fontSize: 12 },
+  helplineNum: { color: '#e74c3c', fontWeight: '900', fontSize: 18, marginTop: 3 },
   loginBgContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', width: '100%' },
   loginTextCenter: { flex: 1, justifyContent: 'center', alignItems: 'center', flexDirection: 'row' },
   loginDynamicText: { fontSize: 34, fontWeight: 'bold', textAlign: 'center' },

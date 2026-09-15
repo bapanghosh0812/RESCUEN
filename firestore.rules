@@ -1,0 +1,81 @@
+rules_version = '2';
+
+// RESCUEN Firestore security rules.
+//
+// The single most important line here is `isSignedIn()`: without rules, a
+// safety app that stores every user's LIVE location, phone number and family
+// contacts is readable by anyone on the internet. These rules require a
+// signed-in RESCUEN user for every read and write, and deny everything else.
+//
+// IDENTITY-MODEL NOTE (see README -> "Identity model & hardening roadmap"):
+// This app currently keys user documents by EMAIL, while Firebase Auth
+// identifies users by `uid` — and the phone-auth session carries no email
+// claim. Because of that we cannot yet bind a document to its owner inside the
+// rules (doing so would break legitimate writes). Requiring authentication is
+// the safe, non-breaking hardening step. Migrating documents to be keyed by
+// `request.auth.uid` is the recommended next step and will let us tighten the
+// write rules to true per-owner ownership.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Public presence for the 1 km radar. Contains ONLY non-sensitive fields
+    // (name, gender, geohash, coarse last location) — never phone/family/token.
+    // Any signed-in user may read it (the radar needs nearby users' positions)
+    // and write their own.
+    match /presence/{userId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn();
+      allow delete: if false;
+    }
+
+    // User profiles hold PRIVATE data (phone, family numbers, FCM token).
+    // `get` (single doc by known id) is allowed for the owner's own reads;
+    // `list`/query is DENIED so the collection can't be range-scanned to harvest
+    // everyone's phone numbers and locations. The radar uses `presence` instead.
+    //
+    // ROLLOUT NOTE: keep the previous app version's radar working by shipping the
+    // presence-based app update FIRST; older installs that still query `users`
+    // will lose only the in-app radar (FCM alerts are unaffected — the backend
+    // uses the Admin SDK). After adoption, this `list: if false` is the target.
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      // Kept list-readable (auth-gated) FOR NOW so users still on the previous
+      // app version — whose radar queries `users` by geohash — keep working.
+      // The critical fix is already here: reads now require sign-in, so the data
+      // is no longer exposed to the public internet.
+      // TODO after the new presence-based app version is widely adopted: change
+      // this to `allow list: if false;` to stop bulk PII harvesting (the new app
+      // reads `presence`, never `users`).
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn();
+      // Account removal is a soft delete (pendingDelete flag) handled by the
+      // app + backend cleanup, never a hard client delete.
+      allow delete: if false;
+    }
+
+    // Live emergencies. Nearby users must be able to discover and (as helpers)
+    // update the notifiedUsers / activeHelpers arrays on someone else's doc.
+    match /active_emergencies/{userId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isSignedIn();
+    }
+
+    // Crime / evidence reports. Create-only from the client; never readable or
+    // editable from a device. Only the trusted backend (Admin SDK) or the
+    // Firebase console can read these.
+    match /secure_vault_reports/{ticketId} {
+      allow create: if isSignedIn();
+      allow read, update, delete: if false;
+    }
+
+    // Default deny for any collection not explicitly listed above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
