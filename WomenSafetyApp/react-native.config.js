@@ -1,11 +1,13 @@
 module.exports = {
   dependencies: {
-    // Disabled on Android: this version references vision-camera APIs
-    // (VisionCameraProxy / FrameProcessorPlugin / Orientation) that don't exist
-    // in the installed react-native-vision-camera, so its Kotlin fails to
-    // compile. It is not imported anywhere in the JS yet. When the AI
-    // face-capture feature is actually wired up, install a face-detector version
-    // that matches the installed vision-camera and remove this entry.
+    // Disabled on Android: the installed face-detector (1.7.2) targets an older
+    // vision-camera API and fails to compile against the installed
+    // vision-camera. Enabling AI face-capture requires aligning a compatible
+    // trio — react-native-vision-camera (>=5.0.10) +
+    // react-native-vision-camera-face-detector (2.1.x) + a newer
+    // react-native-nitro-modules that provides <NitroModules/ReactProp.hpp> —
+    // and testing on a physical device. Do that in a device-connected session,
+    // then remove this entry.
     'react-native-vision-camera-face-detector': {
       platforms: { android: null },
     },

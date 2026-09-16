@@ -1,5 +1,6 @@
 import firestore from '@react-native-firebase/firestore';
 import storage from '@react-native-firebase/storage';
+import auth from '@react-native-firebase/auth';
 import AudioRecorderPlayer from 'react-native-nitro-sound';
 import ReactNativeBlobUtil from 'react-native-blob-util';
 import { Alert } from 'react-native';
@@ -10,7 +11,7 @@ const CACHE_DIR = ReactNativeBlobUtil.fs.dirs.CacheDir;
 class SecureVaultManager {
   static currentSosId = null;
   static isRecordingAudio = false;
-  static audioRecorder = new AudioRecorderPlayer();
+  static audioRecorder = AudioRecorderPlayer; // nitro-sound is a singleton, NOT a class — `new` crashes the app at startup
   static currentAudioPath = null;
   static audioUploadInterval = null;
 
@@ -74,9 +75,13 @@ class SecureVaultManager {
   // storage.rules make this path write-only from clients. This is NOT
   // end-to-end encryption — don't market it as such.
   static async uploadEvidenceChunk(uid, localPath, type) {
-    if (!uid || !localPath) return;
+    // Owner-only path: bind to the Firebase Auth UID (never email) so
+    // storage.rules restrict this evidence to exactly this user — nobody else,
+    // not even other signed-in users, can ever read it.
+    const ownerId = auth().currentUser?.uid;
+    if (!ownerId || !localPath) return;
 
-    const storagePath = `users/${uid}/evidence_vault/${this.currentSosId}/${Date.now()}_${type}`;
+    const storagePath = `users/${ownerId}/evidence_vault/${this.currentSosId}/${Date.now()}_${type}`;
     const reference = storage().ref(storagePath);
 
     try {
@@ -113,7 +118,7 @@ class SecureVaultManager {
         latitude: locationCoords.latitude,
         longitude: locationCoords.longitude
       } : 'No Location Provided',
-      evidenceFolderLink: sessionId !== 'MANUAL_REPORT' ? `users/${user.email}/evidence_vault/${sessionId}` : 'No Automated Evidence',
+      evidenceFolderLink: sessionId !== 'MANUAL_REPORT' ? `users/${auth().currentUser?.uid}/evidence_vault/${sessionId}` : 'No Automated Evidence',
       status: 'SECURED_IN_VAULT',
       timestamp: firestore.FieldValue.serverTimestamp(),
     };

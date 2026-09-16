@@ -14,6 +14,14 @@
       },
       "oauth_client": [
         {
+          "client_id": "991521421004-0f2kh8b7gbsim553b650uijhke97lfq9.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.officialrescuen.app",
+            "certificate_hash": "d324a8d2e0c008f1cbefe8e470c4918dca5c2467"
+          }
+        },
+        {
           "client_id": "991521421004-4te4p3jte9gn5lq8ppcemrgn5ilcb3kd.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
@@ -35,14 +43,6 @@
           "android_info": {
             "package_name": "com.officialrescuen.app",
             "certificate_hash": "fa2b28726553c58c92e3c49b040265861b9172b6"
-          }
-        },
-        {
-          "client_id": "991521421004-gulr2gjv3vnqfie82238f4v0qa9mn9qh.apps.googleusercontent.com",
-          "client_type": 1,
-          "android_info": {
-            "package_name": "com.officialrescuen.app",
-            "certificate_hash": "32733084b57bc92284c857f06c36ea9bd99d68eb"
           }
         },
         {

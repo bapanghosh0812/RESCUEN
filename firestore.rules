@@ -43,15 +43,11 @@ service cloud.firestore {
     // will lose only the in-app radar (FCM alerts are unaffected — the backend
     // uses the Admin SDK). After adoption, this `list: if false` is the target.
     match /users/{userId} {
+      // Single-doc reads only (a signed-in user reading a known doc). LIST/query
+      // is DENIED so the collection can't be scanned to harvest everyone's phone
+      // numbers and locations. The app's radar uses `presence`, never `users`.
       allow get: if isSignedIn();
-      // Kept list-readable (auth-gated) FOR NOW so users still on the previous
-      // app version — whose radar queries `users` by geohash — keep working.
-      // The critical fix is already here: reads now require sign-in, so the data
-      // is no longer exposed to the public internet.
-      // TODO after the new presence-based app version is widely adopted: change
-      // this to `allow list: if false;` to stop bulk PII harvesting (the new app
-      // reads `presence`, never `users`).
-      allow list: if isSignedIn();
+      allow list: if false;
       allow create, update: if isSignedIn();
       // Account removal is a soft delete (pendingDelete flag) handled by the
       // app + backend cleanup, never a hard client delete.

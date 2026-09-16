@@ -1,11 +1,12 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Alert, StatusBar, Image, ScrollView, TextInput, Vibration, Modal, ActivityIndicator, PermissionsAndroid, Linking, LogBox, Platform, NativeModules, Dimensions, Animated, AppState, DeviceEventEmitter } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, Alert, StatusBar, Image, ScrollView, TextInput, Vibration, Modal, ActivityIndicator, PermissionsAndroid, Linking, LogBox, Platform, NativeModules, Dimensions, Animated, AppState, DeviceEventEmitter, Switch, TouchableWithoutFeedback } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Geolocation from 'react-native-geolocation-service';
 import Sound from 'react-native-sound';
 import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
-import functions from '@react-native-firebase/functions'; 
+import functions from '@react-native-firebase/functions';
+import storage from '@react-native-firebase/storage';
 import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import MapView, { Marker, Circle, Polyline, PROVIDER_GOOGLE } from 'react-native-maps'; 
 import { getDistance } from 'geolib'; 
@@ -19,6 +20,9 @@ import RescuenBrain from './src/utils/RescuenBrain';
 import SecureVaultManager from './src/utils/SecureVaultManager';
 import SafeJourneyEngine from './src/utils/SafeJourneyEngine';
 import NotificationManager from './src/utils/NotificationManager';
+import EvidenceCamera from './src/utils/EvidenceCamera';
+import { LANGS, getLang } from './src/utils/i18n';
+import { launchImageLibrary } from 'react-native-image-picker';
 
 const DirectSms = NativeModules.DirectSms;
 
@@ -68,6 +72,38 @@ const sanitizeUserForBroadcast = (u = {}) => ({
 });
 
 const formatCallTime = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+
+// Wellness hub — opens fresh, real content on YouTube (never stale).
+const WELLNESS = [
+  { icon: '🛡️', title: 'Women Safety Tips', desc: 'Stay-safe guides & real situations', q: 'women safety tips and self awareness' },
+  { icon: '🥋', title: 'Self-Defense', desc: 'Practical moves anyone can learn', q: 'self defense techniques for women beginners' },
+  { icon: '🧘‍♀️', title: 'Yoga & Meditation', desc: 'Calm the mind, build strength', q: 'yoga for beginners daily practice' },
+  { icon: '🏃‍♀️', title: 'Exercise & Fitness', desc: 'Home workouts, no equipment', q: 'home workout no equipment beginners' },
+  { icon: '🥗', title: 'Healthy Living Tips', desc: 'Nutrition, sleep & wellbeing', q: 'healthy lifestyle tips daily routine' },
+  { icon: '📚', title: 'Books & Learning', desc: 'Growth, confidence & safety', q: 'best self help and confidence books summary' },
+  { icon: '🧠', title: 'Mental Health', desc: 'Stress, anxiety & self-care', q: 'mental health self care tips' },
+  { icon: '🚨', title: 'Emergency Preparedness', desc: 'Be ready for anything', q: 'personal emergency preparedness tips' },
+];
+
+// Pretty date+time for evidence items, e.g. "16 Sep 2026, 11:40 AM".
+const EVIDENCE_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const fmtEvidenceTime = (ts) => {
+  if (!ts) return 'Unknown time';
+  try {
+    const d = new Date(ts);
+    let h = d.getHours(); const ampm = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${d.getDate()} ${EVIDENCE_MONTHS[d.getMonth()]} ${d.getFullYear()}, ${h}:${mm} ${ampm}`;
+  } catch (e) { return 'Unknown time'; }
+};
+// Classify an evidence item from its type string into display metadata.
+const evidenceMeta = (typeStr = '') => {
+  const t = String(typeStr).toLowerCase();
+  if (t.includes('video')) return { icon: '🎬', label: 'Video + Audio', color: '#8e44ad', cam: t.includes('front') ? 'Front camera' : t.includes('back') ? 'Rear camera' : null };
+  if (t.includes('audio')) return { icon: '🎙️', label: 'Audio recording', color: '#2980b9', cam: null };
+  if (t.includes('capture') || t.includes('photo')) return { icon: '📷', label: 'Captured photo', color: '#16a085', cam: null };
+  return { icon: '📄', label: 'Evidence file', color: '#7f8c8d', cam: null };
+};
 
 try {
   notifee.registerForegroundService((notification) => {
@@ -180,6 +216,54 @@ const CustomAILoader = () => {
   );
 };
 
+// Premium 6-box OTP input: auto-fill (SMS), per-digit 3D bounce, auto-submit.
+const OtpInput = ({ value, onChange, onComplete }) => {
+  const inputRef = useRef(null);
+  const anims = useRef([...Array(6)].map(() => new Animated.Value(1))).current;
+  useEffect(() => {
+    const idx = value.length - 1;
+    if (idx >= 0 && idx < 6) {
+      anims[idx].setValue(0.5);
+      Animated.spring(anims[idx], { toValue: 1, friction: 4, tension: 140, useNativeDriver: true }).start();
+    }
+    if (value.length === 6 && onComplete) onComplete(value);
+  }, [value]);
+  return (
+    <View>
+      <TouchableWithoutFeedback onPress={() => { try { inputRef.current && inputRef.current.focus(); } catch (e) {} }}>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
+          {[...Array(6)].map((_, i) => {
+            const filled = i < value.length;
+            const active = i === value.length;
+            return (
+              <Animated.View key={i} style={[styles.otpBox, filled && styles.otpBoxFilled, active && styles.otpBoxActive, { transform: [{ scale: anims[i] }] }]}>
+                <Text style={styles.otpDigit}>{value[i] || ''}</Text>
+              </Animated.View>
+            );
+          })}
+        </View>
+      </TouchableWithoutFeedback>
+      <TextInput ref={inputRef} value={value} onChangeText={(t) => onChange(t.replace(/[^0-9]/g, '').slice(0, 6))} keyboardType="number-pad" maxLength={6} autoFocus textContentType="oneTimeCode" autoComplete="sms-otp" caretHidden style={{ position: 'absolute', opacity: 0.01, height: 1, width: 1 }} />
+    </View>
+  );
+};
+
+// Success burst: bouncing check + message.
+const OtpSuccess = ({ text }) => {
+  const scale = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.spring(scale, { toValue: 1, friction: 4, tension: 90, useNativeDriver: true }).start();
+  }, []);
+  return (
+    <View style={{ alignItems: 'center', paddingVertical: 30 }}>
+      <Animated.View style={{ width: 90, height: 90, borderRadius: 45, backgroundColor: '#2ecc71', justifyContent: 'center', alignItems: 'center', transform: [{ scale }] }}>
+        <Text style={{ fontSize: 46, color: '#fff' }}>✓</Text>
+      </Animated.View>
+      <Text style={{ fontSize: 18, fontWeight: '900', color: '#1e7e46', marginTop: 18, textAlign: 'center' }}>{text}</Text>
+    </View>
+  );
+};
+
 const MainApp = () => {
   const insets = useSafeAreaInsets();
 
@@ -205,10 +289,58 @@ const MainApp = () => {
   const [currentLocationText, setCurrentLocationText] = useState('🛰️ Locating Safe Server...');
   const [currentCoords, setCurrentCoords] = useState(null); 
   const [isSOSActive, setIsSOSActive] = useState(false);
+  const [safeTest, setSafeTest] = useState(false); // "Test SOS (safe)": records evidence, sends NO alerts
   const [isFollowMe, setIsFollowMe] = useState(false);
+  const [followMeStationarySec, setFollowMeStationarySec] = useState(0);
+  const followMeRefPos = useRef(null);
+  const followMeMoveCount = useRef(0); // consecutive seconds of real movement (jitter filter)
+  const isSOSActiveRef = useRef(false);
   const [showSafeCheck, setShowSafeCheck] = useState(false);
+  const [safeCheckCountdown, setSafeCheckCountdown] = useState(30);
   const [fakeCallState, setFakeCallState] = useState('none'); // 'none' | 'incoming' | 'active'
   const [fakeCallSecs, setFakeCallSecs] = useState(0);
+
+  // --- Premium settings (persisted) ---
+  const [settings, setSettings] = useState({
+    autoAlertPolice: true, sirenOnSos: true, sosVibration: true, shareLocationFamily: true,
+    followMe: false, followMeVoice: true, autoSosNoResponse: true,
+    nearbyAlerts: true, dailyTip: true, notifSound: true, notifVibration: true, reviewReminder: true,
+    hideLocationWhenSafe: false, videoEvidence: true,
+    darkMode: false, reduceMotion: false,
+  });
+  const settingsRef = useRef(settings);
+  // Dark mode: rebuild the entire stylesheet from the palette when toggled, so
+  // every `styles.X` reference re-themes instantly with no per-screen changes.
+  const dark = !!settings.darkMode;
+  const styles = useMemo(() => makeStyles(dark), [dark]);
+  const updateSetting = (key, value) => {
+    setSettings(prev => {
+      const next = { ...prev, [key]: value };
+      AsyncStorage.setItem('app_settings', JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  };
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+  useEffect(() => {
+    AsyncStorage.getItem('app_settings').then(s => { if (s) { try { setSettings(prev => ({ ...prev, ...JSON.parse(s) })); } catch (e) {} } }).catch(() => {});
+  }, []);
+
+  // --- Evidence Vault (PIN-locked, owner-only) ---
+  const [vaultStep, setVaultStep] = useState('loading'); // loading|setPin|confirmPin|otp|enterPin|unlocked
+  const [vaultPin, setVaultPin] = useState('');
+  const [vaultPinFirst, setVaultPinFirst] = useState('');
+  const [vaultOtp, setVaultOtp] = useState('');
+  const [vaultConfirm, setVaultConfirm] = useState(null);
+  const [vaultError, setVaultError] = useState('');
+  const [vaultOtpSuccess, setVaultOtpSuccess] = useState(false);
+  const [vaultItems, setVaultItems] = useState([]);
+  const [vaultLoading, setVaultLoading] = useState(false);
+
+  // --- Language ---
+  const [userLang, setUserLang] = useState('en');
+  const [showLangModal, setShowLangModal] = useState(false);
+  const updateLang = (code) => { setUserLang(code); AsyncStorage.setItem('user_language', code).catch(() => {}); setShowLangModal(false); };
+  useEffect(() => { AsyncStorage.getItem('user_language').then(l => { if (l) setUserLang(l); }).catch(() => {}); }, []);
   
   const [queryPrefix, setQueryPrefix] = useState(null);
   const [rawEmergencies, setRawEmergencies] = useState([]);
@@ -225,6 +357,10 @@ const MainApp = () => {
 
   const [showEditModal, setShowEditModal] = useState(false);
   const [editData, setEditData] = useState({ myPhone: '', familyNumbers: [''] });
+  const [editOtpStep, setEditOtpStep] = useState('form'); // 'form' | 'otp'
+  const [editOtp, setEditOtp] = useState('');
+  const [editConfirm, setEditConfirm] = useState(null);
+  const [editError, setEditError] = useState('');
 
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState([
@@ -359,7 +495,8 @@ const MainApp = () => {
 
   useEffect(() => {
     const subscription = DeviceEventEmitter.addListener('TriggerRescueSOS', (eventData) => {
-        console.log("SOS Triggered internally from", eventData?.source);
+        // Respect the "Auto-SOS if no response" setting for Follow-Me triggers.
+        if (eventData?.source === 'FollowMe' && !settingsRef.current.autoSosNoResponse) return;
         triggerSOS();
     });
     return () => subscription.remove();
@@ -372,6 +509,77 @@ const MainApp = () => {
   }, []);
 
   useEffect(() => { if (isSOSActive) setShowSafeCheck(false); }, [isSOSActive]);
+
+  // Visible countdown while the "Are you safe?" prompt is showing.
+  useEffect(() => {
+    let iv;
+    if (showSafeCheck) {
+      setSafeCheckCountdown(30);
+      iv = setInterval(() => setSafeCheckCountdown(c => (c > 0 ? c - 1 : 0)), 1000);
+    }
+    return () => { if (iv) clearInterval(iv); };
+  }, [showSafeCheck]);
+
+  useEffect(() => { isSOSActiveRef.current = isSOSActive; }, [isSOSActive]);
+
+  // Keep the CPU awake (partial wake lock) for the whole emergency window so the
+  // "Are you safe?" voice, countdown and location keep running with the screen
+  // off / app minimised. Released the instant BOTH SOS and Follow-Me are off.
+  useEffect(() => {
+    try {
+      const wl = NativeModules.RescuenWakeLock;
+      if (!wl) return;
+      if (isFollowMe || isSOSActive) { wl.acquire(); } else { wl.release(); }
+    } catch (e) {}
+  }, [isFollowMe, isSOSActive]);
+
+  // Reliable Follow-Me stationary monitor — GPS can go quiet when truly still,
+  // so we track "how long stopped" on a steady 1-second timer and show it live.
+  //
+  // GPS jitter fix: a stationary phone's fix normally drifts a few metres (and can
+  // spike much more for a single reading). We therefore (1) size the "moved"
+  // threshold to the fix's own accuracy radius (with a 35 m floor) so ordinary
+  // drift is ignored, and (2) require the movement to be SUSTAINED for 2 seconds
+  // before accepting it as real — a lone noisy spike never resets the timer.
+  useEffect(() => {
+    let iv;
+    if (isFollowMe) {
+      followMeRefPos.current = lastCoordsRef.current || currentCoords || null;
+      followMeMoveCount.current = 0;
+      setFollowMeStationarySec(0);
+      iv = setInterval(() => {
+        const c = lastCoordsRef.current;
+        if (!c) return;
+        if (!followMeRefPos.current) { followMeRefPos.current = c; return; }
+        const moved = getDistance(followMeRefPos.current, c);
+        // Ignore drift within the GPS error radius; never react below a 35 m floor.
+        const acc = (typeof c.accuracy === 'number' && c.accuracy > 0) ? c.accuracy : 15;
+        const jitterThreshold = Math.max(35, acc * 1.5);
+        if (moved > jitterThreshold) {
+          // Only accept it once movement persists for 2 consecutive seconds.
+          followMeMoveCount.current += 1;
+          if (followMeMoveCount.current >= 2) {
+            followMeRefPos.current = c;
+            followMeMoveCount.current = 0;
+            setFollowMeStationarySec(0);
+          }
+        } else {
+          followMeMoveCount.current = 0; // back inside the safe radius → not moving
+          setFollowMeStationarySec(s => {
+            if (s >= 180) return 180;
+            const next = s + 1;
+            if (next >= 180 && !isSOSActiveRef.current) { try { SafeJourneyEngine.triggerAreYouSafeWarning(); } catch (e) {} }
+            return next;
+          });
+        }
+      }, 1000);
+    } else {
+      setFollowMeStationarySec(0);
+      followMeRefPos.current = null;
+      followMeMoveCount.current = 0;
+    }
+    return () => { if (iv) clearInterval(iv); };
+  }, [isFollowMe]);
 
   // Fake Call: ring with vibration while incoming; count up while active.
   useEffect(() => {
@@ -475,10 +683,12 @@ const MainApp = () => {
           
           requestEssentialPermissions(parsedUser.email); 
           
-          // 🔥 START PREMIUM NOTIFICATIONS
+          // 🔥 START PREMIUM NOTIFICATIONS (respect the user's saved toggles)
           if (NotificationManager) {
-              NotificationManager.scheduleDailyMorningAlert();
-              NotificationManager.scheduleReviewPush();
+              let ns = {};
+              try { const raw = await AsyncStorage.getItem('app_settings'); if (raw) ns = JSON.parse(raw); } catch (e) {}
+              if (ns.dailyTip !== false) NotificationManager.scheduleDailyMorningAlert();
+              if (ns.reviewReminder !== false) NotificationManager.scheduleReviewPush();
               NotificationManager.setupNotificationListeners();
           }
 
@@ -512,13 +722,13 @@ const MainApp = () => {
   // Gentle radar-ping loop behind the SOS button (only while it's on screen).
   useEffect(() => {
     let loop;
-    if (currentScreen === 'Dashboard' && hasAllTheTimePermission && !isSOSActive) {
+    if (currentScreen === 'Dashboard' && hasAllTheTimePermission && !isSOSActive && !settings.reduceMotion) {
       sosPulse.setValue(0);
       loop = Animated.loop(Animated.timing(sosPulse, { toValue: 1, duration: 1600, useNativeDriver: true }));
       loop.start();
     }
     return () => { if (loop) { try { loop.stop(); } catch (e) {} } };
-  }, [currentScreen, hasAllTheTimePermission, isSOSActive]);
+  }, [currentScreen, hasAllTheTimePermission, isSOSActive, settings.reduceMotion]);
 
   const checkAndRequestLocation = async () => {
     try {
@@ -564,9 +774,9 @@ const MainApp = () => {
   const startGPS = () => {
     Geolocation.getCurrentPosition(
       (pos) => {
-        const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, speed: pos.coords.speed };
+        const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, speed: pos.coords.speed, accuracy: pos.coords.accuracy };
         setCurrentCoords(loc);
-        if (pos.coords.accuracy <= 10) { setCurrentLocationText('🟢 Exact Pin-Point Locked'); } 
+        if (pos.coords.accuracy <= 10) { setCurrentLocationText('🟢 Exact Pin-Point Locked'); }
         else { setCurrentLocationText('🟡 Refining Accuracy...'); }
       },
       (error) => {}, { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
@@ -574,9 +784,9 @@ const MainApp = () => {
 
     Geolocation.watchPosition(
       (pos) => {
-        const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, speed: pos.coords.speed };
+        const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, speed: pos.coords.speed, accuracy: pos.coords.accuracy };
         setCurrentCoords(loc);
-        
+
         // Pass data to SafeJourneyEngine (Phase 2)
         if (SafeJourneyEngine) SafeJourneyEngine.processLocation(loc.speed, loc.latitude, loc.longitude);
         
@@ -589,7 +799,8 @@ const MainApp = () => {
 
   useEffect(() => {
     if (currentCoords) lastCoordsRef.current = currentCoords;
-    if (currentCoords && user && user.email) {
+    // "Hide my location when safe": don't publish location unless an SOS is active.
+    if (currentCoords && user && user.email && !(settings.hideLocationWhenSafe && !isSOSActive)) {
        const hash = encodeGeohash(currentCoords.latitude, currentCoords.longitude);
        // Publish location to `presence` (no phone/family/token — safe for nearby
        // users to read for the radar) and mirror to the user doc for backward
@@ -611,8 +822,8 @@ const MainApp = () => {
     if (isSOSActive && user.email) {
       watchId = Geolocation.watchPosition(
         (pos) => {
-          const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, speed: pos.coords.speed };
-          setCurrentCoords(loc); 
+          const loc = { latitude: pos.coords.latitude, longitude: pos.coords.longitude, speed: pos.coords.speed, accuracy: pos.coords.accuracy };
+          setCurrentCoords(loc);
           const hash = encodeGeohash(loc.latitude, loc.longitude);
           firestore().collection('active_emergencies').doc(user.email).set({
             location: loc,
@@ -629,7 +840,7 @@ const MainApp = () => {
              if(doc.exists) {
                 const data = doc.data();
                 setBroadcastMetrics({
-                   totalNotified: data?.notifiedUsers?.length || 0,
+                   totalNotified: (typeof data?.nearbyCount === 'number' ? data.nearbyCount : (data?.notifiedUsers?.length || 0)),
                    helpers: data?.activeHelpers?.length || 0
                 });
              }
@@ -641,16 +852,17 @@ const MainApp = () => {
           .orderBy('h').startAt(queryPrefix).endAt(queryPrefix + '\uf8ff')
           .onSnapshot(snap => {
             try {
+              const center = lastCoordsRef.current || currentCoords;
               let usersList = [];
               snap.forEach(doc => {
                 const data = doc.data();
-                if (data.email !== user.email && data.lastKnownLocation) {
-                   const dist = getDistance(currentCoords, data.lastKnownLocation);
-                   usersList.push({ ...data, dist });
+                if (data.email !== user.email && data.lastKnownLocation && center) {
+                   const dist = getDistance(center, data.lastKnownLocation);
+                   if (dist <= 1000) usersList.push({ ...data, dist }); // ONLY within the 1 km radar
                 }
               });
               usersList.sort((a,b) => a.dist - b.dist);
-              setVictimMapHelpers(usersList.slice(0, 10)); 
+              setVictimMapHelpers(usersList.slice(0, 20));
             } catch(e){}
           });
       }
@@ -704,8 +916,8 @@ const MainApp = () => {
 
     setNearbyEmergenciesList(allNearby);
     const validEmergency = allNearby.find(e => !ignoredEmergencies.includes(e.id));
-    
-    if (validEmergency) {
+
+    if (validEmergency && settings.nearbyAlerts) {
        if (!validEmergency.notifiedUsers || !validEmergency.notifiedUsers.includes(myEmail)) {
           firestore().collection('active_emergencies').doc(validEmergency.id)
              .update({ notifiedUsers: firestore.FieldValue.arrayUnion(myEmail) }).catch(()=>{});
@@ -910,15 +1122,10 @@ const MainApp = () => {
   };
 
   const handleOpenEditModal = () => {
-    const lastUpdate = user.lastNumberUpdate || 0;
-    const now = Date.now();
-    const daysPassed = (now - lastUpdate) / (1000 * 60 * 60 * 24);
-
-    if (lastUpdate !== 0 && daysPassed < 60) {
-      const daysLeft = Math.ceil(60 - daysPassed);
-      return Alert.alert("Limit Reached", `You can only update your numbers once every 60 days.\n\nPlease try again in ${daysLeft} days.`);
-    }
-    setEditData({ myPhone: user.myPhone, familyNumbers: [...(user.familyNumbers || [''])] });
+    // Always open — family numbers can be edited anytime. Only the user's OWN
+    // number has a 60-day change lock (enforced on save).
+    setEditData({ myPhone: user.myPhone, familyNumbers: [...(user.familyNumbers && user.familyNumbers.length ? user.familyNumbers : [''])] });
+    setEditOtpStep('form'); setEditOtp(''); setEditError(''); setEditConfirm(null);
     setShowEditModal(true);
   };
 
@@ -927,25 +1134,64 @@ const MainApp = () => {
     newNumbers[index] = text.replace(/[^0-9]/g, '').slice(0, 10);
     setEditData({...editData, familyNumbers: newNumbers});
   };
+  const addEditFamilyNumber = () => {
+    if (editData.familyNumbers.length < 5) setEditData({ ...editData, familyNumbers: [...editData.familyNumbers, ''] });
+  };
+  const removeEditFamilyNumber = (index) => {
+    const newNumbers = [...editData.familyNumbers];
+    newNumbers.splice(index, 1);
+    setEditData({ ...editData, familyNumbers: newNumbers.length ? newNumbers : [''] });
+  };
 
-  const saveEditedNumbers = async () => {
+  const doSaveNumbers = async () => {
     const validFamilyNums = editData.familyNumbers.filter(n => n && n.length === 10);
-    if (editData.myPhone.length !== 10 || validFamilyNums.length === 0) return Alert.alert("Invalid Input", "Please enter valid 10-digit phone numbers.");
-    
+    const phoneChanged = editData.myPhone !== user.myPhone;
     setIsLoading(true);
     try {
       const now = Date.now();
-      const updatedUser = { ...user, myPhone: editData.myPhone, familyNumbers: validFamilyNums, familyNum: validFamilyNums[0], lastNumberUpdate: now };
-
-      await firestore().collection('users').doc(user.email).update({
-        myPhone: editData.myPhone, familyNumbers: validFamilyNums, familyNum: validFamilyNums[0], lastNumberUpdate: now
-      });
-
+      const payload = { myPhone: editData.myPhone, familyNumbers: validFamilyNums, familyNum: validFamilyNums[0] };
+      if (phoneChanged) payload.lastPhoneUpdate = now; // only the OWN-number lock resets on a phone change
+      const updatedUser = { ...user, ...payload };
+      await firestore().collection('users').doc(user.email).update(payload);
       await AsyncStorage.setItem('userSession', JSON.stringify(updatedUser));
-      setUser(updatedUser); setShowEditModal(false);
-      Alert.alert("Success", "Your numbers have been updated safely!");
-    } catch (error) { Alert.alert("Update Error", String(error.message || error)); } 
+      setUser(updatedUser);
+      setEditOtpStep('form'); setShowEditModal(false);
+      Alert.alert("Success", "Your emergency contacts have been updated safely!");
+    } catch (error) { Alert.alert("Update Error", String(error.message || error)); }
     finally { setIsLoading(false); }
+  };
+
+  const saveEditedNumbers = async () => {
+    const validFamilyNums = editData.familyNumbers.filter(n => n && n.length === 10);
+    if (editData.myPhone.length !== 10) return Alert.alert("Invalid Number", "Enter a valid 10-digit phone number.");
+    if (validFamilyNums.length === 0) return Alert.alert("Missing Contact", "At least 1 family emergency number (10 digits) is required.");
+    // MY OWN number: 60-day change lock + OTP verification. Family numbers: anytime.
+    if (editData.myPhone !== user.myPhone) {
+      const lastPhone = user.lastPhoneUpdate || 0;
+      const daysPassed = (Date.now() - lastPhone) / (1000 * 60 * 60 * 24);
+      if (lastPhone !== 0 && daysPassed < 60) {
+        return Alert.alert("Number Change Locked", `Your own number can be changed once every 60 days (try again in ${Math.ceil(60 - daysPassed)} days).\n\nFamily numbers can be added, edited or removed anytime — just leave your own number unchanged and save.`);
+      }
+      setIsLoading(true); setEditError('');
+      try {
+        const conf = await auth().signInWithPhoneNumber('+91' + editData.myPhone);
+        setEditConfirm(conf); setEditOtp(''); setEditOtpStep('otp');
+      } catch (e) { setEditError('Could not send OTP. Check the number and network.'); }
+      finally { setIsLoading(false); }
+      return;
+    }
+    doSaveNumbers(); // phone unchanged → save family numbers anytime, no OTP
+  };
+
+  const verifyEditOtp = async () => {
+    const code = editOtp.replace(/[^0-9]/g, '').slice(0, 6);
+    if (code.length !== 6) { setEditError('Enter the 6-digit OTP'); return; }
+    if (!editConfirm) { setEditError('OTP expired — go back and try again'); return; }
+    try {
+      await editConfirm.confirm(code); // new number verified for real
+      setEditError('');
+      await doSaveNumbers();
+    } catch (e) { setEditError('Invalid OTP, try again'); setEditOtp(''); }
   };
 
   const startForegroundService = async () => {
@@ -968,13 +1214,17 @@ const MainApp = () => {
       setBroadcastMetrics({ totalNotified: 0, helpers: 0 });
       
       try { Vibration.cancel(); } catch(e){}
-      if (sirenSound.current) { try { sirenSound.current.setVolume(1.0); sirenSound.current.play(); } catch(e) {} }
-      try { Vibration.vibrate([0, 1000, 500, 1000, 500, 1000, 500, 1000], true); } catch (e) {}
+      const st = settingsRef.current;
+      if (st.sirenOnSos && sirenSound.current) { try { sirenSound.current.setVolume(1.0); sirenSound.current.play(); } catch(e) {} }
+      if (st.sosVibration) { try { Vibration.vibrate([0, 1000, 500, 1000, 500, 1000, 500, 1000], true); } catch (e) {} }
 
       try { await startForegroundService(); } catch(e) {}
       
       // 🔥 START SECURE VAULT RECORDING (PHASE 3)
-      if (SecureVaultManager) SecureVaultManager.startAudioEvidence(user.email);
+      // When video evidence is on, the camera records audio+video together, so we
+      // must NOT also grab the mic here (that would conflict). Audio-only recorder
+      // runs only when video evidence is disabled.
+      if (SecureVaultManager && !st.videoEvidence) SecureVaultManager.startAudioEvidence(user.email);
 
       // Use freshest location; fall back to last known so an SOS is never lost
       // just because GPS hasn't re-locked at the moment of the trigger.
@@ -1001,18 +1251,24 @@ const MainApp = () => {
       const lat = coords ? coords.latitude : 0;
       const lng = coords ? coords.longitude : 0;
       const mapLink = coords ? `https://maps.google.com/?q=${lat},${lng}` : 'Location Unavailable';
-      const smsBody = `URGENT EMERGENCY: I am ${user.name}. I am in severe danger. Track me: ${mapLink}`;
+      // "Always share live location with family" — include the live map link only if enabled.
+      const smsBody = st.shareLocationFamily
+        ? `🚨 RESCUEN EMERGENCY ALERT 🚨\n${user.name} is in danger and needs help NOW.\n📍 Live location: ${mapLink}\nPlease reach them or call the police immediately.\n\n— Sent automatically by RESCUEN Team`
+        : `🚨 RESCUEN EMERGENCY ALERT 🚨\n${user.name} is in danger and needs help NOW.\nPlease call/reach them immediately or alert the police.\n\n— Sent automatically by RESCUEN Team`;
 
       try {
         const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.SEND_SMS);
         const validNumbers = (user.familyNumbers || []).filter(n => n && n.length === 10);
+        // Emergency services: 112 is India's ERSS number, which (unlike the 100
+        // voice line) accepts SMS. Included only if "Auto-alert police" is on.
+        const recipients = st.autoAlertPolice ? ['112', ...validNumbers] : [...validNumbers];
 
         if (hasPermission && typeof DirectSms !== 'undefined') {
           validNumbers.forEach(num => { try { DirectSms.sendDirectSms(num, smsBody); } catch(e){} });
-          try { DirectSms.sendDirectSms('100', smsBody); } catch(e){}
-        } else {
+          if (st.autoAlertPolice) { try { DirectSms.sendDirectSms('112', smsBody); } catch(e){} }
+        } else if (recipients.length > 0) {
           const separator = Platform.OS === 'ios' ? ',' : ';';
-          const joinedNums = ['100', ...validNumbers].join(separator);
+          const joinedNums = recipients.join(separator);
           const url = `sms:${joinedNums}?body=${encodeURIComponent(smsBody)}`;
           Linking.openURL(url).catch(err => {});
         }
@@ -1020,6 +1276,13 @@ const MainApp = () => {
 
     } catch (error) { console.log(error); } 
     finally { isTriggering.current = false; setTimeout(() => { actionLock.current = false; }, 2000); }
+  };
+
+  // SOS fires immediately on a 2-second HOLD of the panic button — the hold
+  // itself is the accidental-trigger guard, so no extra countdown delays help.
+  const requestSOS = () => {
+    if (isSOSActive || isTriggering.current) return;
+    triggerSOS();
   };
 
   const deactivateSOS = async () => {
@@ -1118,6 +1381,7 @@ const MainApp = () => {
     setIsAITyping(true);
 
     let contextData = {};
+    contextData.userLanguage = getLang(userLang).name;
     const lastSosData = await AsyncStorage.getItem('last_sos_received');
     if (lastSosData) contextData.lastReceivedSOS = JSON.parse(lastSosData);
     if (nearbyEmergenciesList.length > 0) contextData.activeNearbyEmergencies = nearbyEmergenciesList;
@@ -1129,10 +1393,144 @@ const MainApp = () => {
     setIsAITyping(false);
   };
 
+  // ---- Settings screen building blocks ----
+  const renderSetToggle = (icon, label, key, desc) => (
+    <View style={styles.setRow}>
+      <View style={{ flex: 1, paddingRight: 12 }}>
+        <Text style={styles.setLabel}>{icon}  {label}</Text>
+        {desc ? <Text style={styles.setDesc}>{desc}</Text> : null}
+      </View>
+      <Switch value={!!settings[key]} onValueChange={(v) => updateSetting(key, v)} trackColor={{ true: '#004aad', false: '#d0d5dd' }} thumbColor="#ffffff" />
+    </View>
+  );
+  const renderSetNav = (icon, label, onPress, opts = {}) => (
+    <TouchableOpacity style={styles.setRow} onPress={onPress} activeOpacity={0.7}>
+      <Text style={[styles.setLabel, opts.danger && { color: '#e74c3c' }]}>{icon}  {label}</Text>
+      <Text style={[styles.setArrow, opts.danger && { color: '#e74c3c' }]}>{opts.value ? opts.value + '   ›' : '›'}</Text>
+    </TouchableOpacity>
+  );
+  const renderSetSection = (title, children) => (
+    <View style={styles.setSection}>
+      <Text style={styles.setSectionTitle}>{title}</Text>
+      <View style={styles.setSectionCard}>{children}</View>
+    </View>
+  );
+  const shareApp = () => { try { Linking.openURL('https://play.google.com/store/apps/details?id=com.officialrescuen.app'); } catch (e) {} };
+
+  // ---- Profile photo (add / modify / delete) ----
+  const [profileUploading, setProfileUploading] = useState(false);
+  const selectProfilePhoto = async () => {
+    try {
+      const res = await launchImageLibrary({ mediaType: 'photo', quality: 0.7, maxWidth: 800, maxHeight: 800 });
+      if (res.didCancel || !res.assets || !res.assets[0] || !res.assets[0].uri) return;
+      const uri = res.assets[0].uri;
+      const uid = auth().currentUser?.uid;
+      if (!uid) return;
+      setProfileUploading(true);
+      const ref = storage().ref(`users/${uid}/profile/avatar.jpg`);
+      await ref.putFile(uri);
+      const url = await ref.getDownloadURL();
+      await firestore().collection('users').doc(user.email).update({ photoURL: url }).catch(() => {});
+      const updated = { ...user, photoURL: url };
+      await AsyncStorage.setItem('userSession', JSON.stringify(updated)).catch(() => {});
+      setUser(updated);
+    } catch (e) { Alert.alert('Error', 'Could not update photo. Please try again.'); }
+    finally { setProfileUploading(false); }
+  };
+  const deleteProfilePhoto = async () => {
+    try {
+      setProfileUploading(true);
+      const uid = auth().currentUser?.uid;
+      try { await storage().ref(`users/${uid}/profile/avatar.jpg`).delete(); } catch (e) {}
+      await firestore().collection('users').doc(user.email).update({ photoURL: firestore.FieldValue.delete() }).catch(() => {});
+      const updated = { ...user }; delete updated.photoURL;
+      await AsyncStorage.setItem('userSession', JSON.stringify(updated)).catch(() => {});
+      setUser(updated);
+    } catch (e) {} finally { setProfileUploading(false); }
+  };
+  const pickProfilePhoto = () => {
+    const opts = [{ text: 'Choose from Gallery', onPress: selectProfilePhoto }];
+    if (user.photoURL) opts.push({ text: 'Remove Photo', style: 'destructive', onPress: deleteProfilePhoto });
+    opts.push({ text: 'Cancel', style: 'cancel' });
+    Alert.alert('Profile Photo', 'Add, change or remove your photo', opts);
+  };
+
+  // ---- Evidence Vault logic ----
+  const hashPin = (pin) => { let h = 5381; const s = 'rescuen_vault_' + pin; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return String(h); };
+  const loadEvidence = async () => {
+    setVaultLoading(true);
+    try {
+      const uid = auth().currentUser?.uid;
+      if (!uid) { setVaultItems([]); setVaultLoading(false); return; }
+      const root = storage().ref(`users/${uid}/evidence_vault`);
+      const sessions = await root.listAll();
+      let items = [];
+      const parse = (name) => {
+        const m = String(name).match(/^(\d{10,})_?(.*)$/); // "<timestamp>_<type>"
+        return { ts: m ? parseInt(m[1], 10) : null, typeStr: m ? m[2] : String(name) };
+      };
+      for (const folder of sessions.prefixes) {
+        const inner = await folder.listAll();
+        for (const it of inner.items) { const p = parse(it.name); items.push({ session: folder.name, ref: it, ts: p.ts, typeStr: p.typeStr }); }
+      }
+      for (const it of sessions.items) { const p = parse(it.name); items.push({ session: 'general', ref: it, ts: p.ts, typeStr: p.typeStr }); }
+      items.sort((a, b) => (b.ts || 0) - (a.ts || 0)); // newest first
+      setVaultItems(items);
+    } catch (e) { setVaultItems([]); }
+    setVaultLoading(false);
+  };
+  const openVaultStep = async () => {
+    setVaultError(''); setVaultPin(''); setVaultPinFirst(''); setVaultOtp('');
+    try {
+      const saved = await AsyncStorage.getItem('vault_pin_hash');
+      setVaultStep(saved ? 'enterPin' : 'setPin');
+    } catch (e) { setVaultStep('setPin'); }
+  };
+  const submitSetPin = () => {
+    if (vaultPin.length !== 4) { setVaultError('Enter a 4-digit PIN'); return; }
+    setVaultPinFirst(vaultPin); setVaultPin(''); setVaultError(''); setVaultStep('confirmPin');
+  };
+  const submitConfirmPin = async () => {
+    if (vaultPin !== vaultPinFirst) { setVaultError('PINs do not match'); setVaultPin(''); return; }
+    setVaultError('');
+    try {
+      const conf = await auth().signInWithPhoneNumber('+91' + (user.myPhone || ''));
+      setVaultConfirm(conf); setVaultOtp(''); setVaultStep('otp');
+    } catch (e) {
+      // OTP is MANDATORY — never save the PIN without real verification.
+      setVaultError('Could not send OTP. Check your network and try again.');
+    }
+  };
+  const verifyVaultOtp = async () => {
+    const code = vaultOtp.replace(/[^0-9]/g, '').slice(0, 6);
+    if (code.length !== 6) { setVaultError('Enter the 6-digit OTP'); return; }
+    if (!vaultConfirm) { setVaultError('OTP session expired. Go back and set the PIN again.'); return; }
+    try {
+      await vaultConfirm.confirm(code); // MUST succeed — real OTP verification, no bypass
+      await AsyncStorage.setItem('vault_pin_hash', hashPin(vaultPinFirst));
+      setVaultError(''); setVaultOtpSuccess(true);
+      setTimeout(() => { setVaultOtpSuccess(false); setVaultStep('unlocked'); loadEvidence(); }, 1700);
+    } catch (e) {
+      setVaultError('Invalid OTP, try again'); setVaultOtp('');
+    }
+  };
+  const submitEnterPin = async () => {
+    try {
+      const saved = await AsyncStorage.getItem('vault_pin_hash');
+      if (saved && saved === hashPin(vaultPin)) { setVaultError(''); setVaultStep('unlocked'); loadEvidence(); }
+      else { setVaultError('Wrong PIN'); setVaultPin(''); }
+    } catch (e) { setVaultError('Something went wrong'); }
+  };
+  useEffect(() => { if (currentScreen === 'Vault') openVaultStep(); }, [currentScreen]);
+
   return (
     <View style={[styles.main, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
-      <StatusBar barStyle="dark-content" backgroundColor="transparent" translucent={true} />
-      
+      <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor="transparent" translucent={true} />
+
+      {/* Hidden background evidence recorder — records rear+front (alternating)
+          during SOS while the SOS screen stays in front. Isolated & best-effort. */}
+      <EvidenceCamera active={(isSOSActive || safeTest) && settings.videoEvidence} />
+
       <View style={styles.header}>
         <Image source={require('./android/app/src/main/res/drawable/logo.png')} style={styles.logo} />
         <Text style={styles.headerTitle}>RESCUEN</Text>
@@ -1265,7 +1663,16 @@ const MainApp = () => {
           {currentScreen === 'ProfileSetup' && (
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Set Up Rescue Profile</Text>
-              
+
+              <Text style={styles.label}>CHOOSE YOUR LANGUAGE</Text>
+              <View style={{flexDirection: 'row', flexWrap: 'wrap', marginBottom: 10}}>
+                {LANGS.map(l => (
+                  <TouchableOpacity key={l.code} style={[styles.langChip, userLang === l.code && styles.langChipActive]} onPress={() => updateLang(l.code)}>
+                    <Text style={[styles.langChipText, userLang === l.code && {color: '#fff'}]}>{l.name}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
               <Text style={styles.label}>YOUR PHONE NUMBER</Text>
               <View style={{flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15}}>
                 <TextInput 
@@ -1401,7 +1808,7 @@ const MainApp = () => {
               
               <View style={{ backgroundColor: '#ffffff', padding: 15, borderRadius: 10, marginBottom: 20, borderWidth: 1, borderColor: '#ccc' }}>
                 <Text style={{ fontWeight: 'bold', color: '#e74c3c', marginBottom: 5 }}>STEP 1:</Text>
-                <Text style={{ color: '#333', fontSize: 13, marginBottom: 15, fontWeight: 'bold' }}>Tap below -> Go to "Battery" -> Select "Unrestricted" (No Restrictions). Also turn ON "Auto-Start".</Text>
+                <Text style={{ color: '#333', fontSize: 13, marginBottom: 15, fontWeight: 'bold' }}>Tap below → Go to "Battery" → Select "Unrestricted" (No Restrictions). Also turn ON "Auto-Start".</Text>
                 <TouchableOpacity style={[styles.btn, { backgroundColor: '#000', elevation: 5 }]} onPress={() => Linking.openSettings()}>
                   <Text style={styles.btnText}>⚙️ OPEN SETTINGS</Text>
                 </TouchableOpacity>
@@ -1488,12 +1895,22 @@ const MainApp = () => {
                      </Text>
                    </TouchableOpacity>
 
+                   {isFollowMe && (
+                     <View style={styles.followStatus}>
+                       <Text style={styles.followStatusText}>{followMeStationarySec > 0 ? '⏱️ Stopped for' : '🟢 Moving — all good'}</Text>
+                       {followMeStationarySec > 0 && (
+                         <Text style={styles.followTimer}>{formatCallTime(followMeStationarySec)} <Text style={{fontSize: 14, color: '#8a94a6'}}>/ 3:00</Text></Text>
+                       )}
+                       <Text style={styles.followStatusSub}>If you stay stopped for 3:00, RESCUEN will ask "Are you safe?" — no reply → auto SOS.</Text>
+                     </View>
+                   )}
+
                    <View style={styles.panicWrap}>
                      <Animated.View pointerEvents="none" style={[styles.panicPulse, {
                         opacity: sosPulse.interpolate({ inputRange: [0, 1], outputRange: [0.45, 0] }),
                         transform: [{ scale: sosPulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.6] }) }],
                      }]} />
-                     <TouchableOpacity style={styles.panicBtn} onLongPress={triggerSOS} delayLongPress={2000} activeOpacity={0.85}>
+                     <TouchableOpacity style={styles.panicBtn} onLongPress={requestSOS} delayLongPress={2000} activeOpacity={0.85}>
                         <Text style={styles.panicText}>SOS</Text>
                         <Text style={styles.panicHint}>HOLD</Text>
                      </TouchableOpacity>
@@ -1502,6 +1919,24 @@ const MainApp = () => {
                  </>
                )}
 
+            </View>
+          )}
+
+          {currentScreen === 'Wellness' && (
+            <View>
+              <Text style={styles.cardTitle}>💚 Wellness & Safety</Text>
+              <Text style={{ color: dark ? '#9aa5b1' : '#666', marginBottom: 16, fontWeight: 'bold', lineHeight: 20 }}>Curated, always-fresh videos & guides to stay safe, strong and healthy — opens on YouTube.</Text>
+              {WELLNESS.map(cat => (
+                <TouchableOpacity key={cat.q} style={styles.wellCard} activeOpacity={0.75} onPress={() => Linking.openURL('https://www.youtube.com/results?search_query=' + encodeURIComponent(cat.q))}>
+                  <Text style={{ fontSize: 30, marginRight: 14 }}>{cat.icon}</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.wellTitle}>{cat.title}</Text>
+                    <Text style={styles.wellDesc}>{cat.desc}</Text>
+                  </View>
+                  <Text style={{ color: '#e74c3c', fontWeight: '900', fontSize: 20 }}>▶</Text>
+                </TouchableOpacity>
+              ))}
+              <View style={{ height: 20 }} />
             </View>
           )}
 
@@ -1551,7 +1986,7 @@ const MainApp = () => {
               <View style={styles.chatContainer}>
                 {chatMessages.map((msg, index) => (
                   <View key={index} style={[styles.chatBubble, msg.sender === 'user' ? styles.chatBubbleUser : styles.chatBubbleAI]}>
-                    <Text style={[styles.chatText, msg.sender === 'user' ? {color: '#fff'} : {color: '#333'}]}>
+                    <Text style={[styles.chatText, msg.sender === 'user' ? {color: '#fff'} : {color: dark ? '#e6ebf1' : '#333'}]}>
                       {renderChatText(msg.text)}
                     </Text>
                   </View>
@@ -1566,36 +2001,202 @@ const MainApp = () => {
           )}
 
           {currentScreen === 'ProfileView' && (
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>User Dashboard</Text>
-              <View style={styles.profileRow}><Text style={styles.profileLabel}>NAME</Text><Text style={styles.profileValue}>{user.name}</Text></View>
-              <View style={styles.profileRow}><Text style={styles.profileLabel}>EMAIL</Text><Text style={styles.profileValue}>{user.email}</Text></View>
-              <View style={styles.profileRow}><Text style={styles.profileLabel}>MY PHONE</Text><Text style={styles.profileValue}>+91 {user.myPhone}</Text></View>
-              <View style={[styles.profileRow, {borderBottomWidth: 0}]}>
-                  <Text style={styles.profileLabel}>FAMILY ({user.familyNumbers?.filter(n=>n.length===10).length || 0})</Text>
-                  <Text style={styles.profileValue}>
-                    +91 {user.familyNumbers && user.familyNumbers[0]} {user.familyNumbers?.length > 1 ? `(+${user.familyNumbers.length - 1} more)` : ''}
-                  </Text>
+            <>
+              <View style={styles.profileHero}>
+                <TouchableOpacity style={styles.profileAvatar} onPress={pickProfilePhoto} activeOpacity={0.8}>
+                  {profileUploading ? <ActivityIndicator color="#004aad" /> : (user.photoURL ? <Image source={{ uri: user.photoURL }} style={{ width: 86, height: 86, borderRadius: 43 }} /> : <Text style={{ fontSize: 42 }}>{user.gender === 'Female' ? '👩' : user.gender === 'Male' ? '👨' : '🧑'}</Text>)}
+                  <View style={styles.avatarCam}><Text style={{ fontSize: 12 }}>📷</Text></View>
+                </TouchableOpacity>
+                <Text style={styles.profileName}>{user.name || 'RESCUEN User'}</Text>
+                <Text style={styles.profileEmail}>{user.email}</Text>
+                <View style={styles.profileBadge}><Text style={styles.profileBadgeText}>🛡️ Protected by RESCUEN</Text></View>
               </View>
-              
-              <TouchableOpacity style={[styles.btn, {backgroundColor: '#27ae60', marginTop: 30}]} onPress={handleOpenEditModal}>
-                <Text style={styles.btnText}>EDIT NUMBERS</Text>
+              <View style={styles.profileStatsRow}>
+                <View style={styles.profileStat}><Text style={styles.profileStatNum}>{user.familyNumbers?.filter(n=>n&&n.length===10).length || 0}</Text><Text style={styles.profileStatLabel}>Guardians</Text></View>
+                <View style={styles.profileStatDivider} />
+                <View style={styles.profileStat}><Text style={styles.profileStatNum}>1 KM</Text><Text style={styles.profileStatLabel}>Radar</Text></View>
+                <View style={styles.profileStatDivider} />
+                <View style={styles.profileStat}><Text style={styles.profileStatNum}>24/7</Text><Text style={styles.profileStatLabel}>Guarded</Text></View>
+              </View>
+              <TouchableOpacity style={[styles.btn, {marginTop: 22}]} onPress={() => setCurrentScreen('Settings')}>
+                <Text style={styles.btnText}>⚙️  SETTINGS & PRIVACY</Text>
               </TouchableOpacity>
-
-              <TouchableOpacity style={[styles.btn, {backgroundColor: '#34495e', marginTop: 15}]} onPress={handleLogout}>
-                <Text style={styles.btnText}>LOGOUT</Text>
+              <TouchableOpacity style={[styles.btn, {backgroundColor:'#27ae60', marginTop: 12}]} onPress={handleOpenEditModal}>
+                <Text style={styles.btnText}>✏️  EDIT EMERGENCY CONTACTS</Text>
               </TouchableOpacity>
+            </>
+          )}
 
-              <TouchableOpacity style={[styles.btn, {backgroundColor: '#e74c3c', marginTop: 15}]} onPress={() => setShowDeleteModal(true)}>
-                <Text style={styles.btnText}>DELETE ACCOUNT</Text>
-              </TouchableOpacity>
+          {currentScreen === 'Settings' && (
+            <View>
+              <View style={styles.settingsHeader}>
+                <TouchableOpacity onPress={() => setCurrentScreen('ProfileView')} style={{paddingVertical: 4, paddingRight: 10}}><Text style={styles.settingsBack}>‹ Back</Text></TouchableOpacity>
+                <Text style={styles.settingsTitle}>Settings</Text>
+                <View style={{width: 60}} />
+              </View>
 
-              <TouchableOpacity style={{marginTop: 25, alignItems: 'center'}} onPress={() => setCurrentScreen('ReadTC')}>
-                <Text style={{color: '#3498db', fontWeight: 'bold', fontSize: 13, textDecorationLine: 'underline'}}>
-                  📜 READ TERMS & PRIVACY POLICY
-                </Text>
-              </TouchableOpacity>
+              {renderSetSection('PROFILE', <>
+                {renderSetNav('👤', 'Name', () => {}, { value: user.name || '—' })}
+                {renderSetNav('📧', 'Email', () => {}, { value: (user.email||'').length>16 ? (user.email.slice(0,14)+'…') : (user.email||'—') })}
+                {renderSetNav('📱', 'My phone', () => {}, { value: '+91 '+(user.myPhone||'—') })}
+                {renderSetNav('⚧', 'Gender', () => {}, { value: user.gender || '—' })}
+                {renderSetNav('✏️', 'Edit emergency contacts', handleOpenEditModal)}
+              </>)}
 
+              {renderSetSection('EMERGENCY & SOS', <>
+                {renderSetToggle('🚓', 'Auto-alert emergency (112)', 'autoAlertPolice')}
+                {renderSetToggle('📢', 'Siren on SOS', 'sirenOnSos')}
+                {renderSetToggle('📳', 'Vibration on SOS', 'sosVibration')}
+                {renderSetNav('🔊', 'Volume-key triple-press SOS', () => Alert.alert('Volume-Key SOS', 'Always on — triple-press the volume key to trigger SOS, even from a locked screen.'), { value: 'On' })}
+                {renderSetToggle('📍', 'Always share live location with family', 'shareLocationFamily')}
+                {renderSetToggle('🎥', 'Record video + audio evidence on SOS', 'videoEvidence', 'Silently records video WITH sound (rear + front) to your private Evidence Vault during an SOS')}
+                {renderSetNav('🧪', 'Test SOS (safe)', () => {
+                  setCurrentScreen('Dashboard');
+                  setSafeTest(true);
+                  Alert.alert('Safe SOS test 🧪', settings.videoEvidence
+                    ? 'Recording evidence now — rear then front camera, saving to your Evidence Vault. NO SMS or alert is sent to anyone. Let it run ~1 minute to capture both cameras, tap "END TEST" when done, then open the Evidence Vault to see the clips.'
+                    : 'This is a safe test — no alert is sent. Turn on "Record video + audio evidence" to also test the camera.');
+                }, { value: 'Run' })}
+              </>)}
+
+              {renderSetSection('SAFE JOURNEY (FOLLOW-ME)', <>
+                <View style={styles.setRow}>
+                  <View style={{ flex: 1, paddingRight: 12 }}>
+                    <Text style={styles.setLabel}>🧭  Enable Follow-Me guarding</Text>
+                    <Text style={styles.setDesc}>Guards your journey; auto-SOS if you stop unexpectedly</Text>
+                  </View>
+                  <Switch value={isFollowMe} onValueChange={() => toggleFollowMe()} trackColor={{ true: '#004aad', false: '#d0d5dd' }} thumbColor="#ffffff" />
+                </View>
+                {renderSetToggle('🗣️', 'Voice "Are you safe?" alerts', 'followMeVoice')}
+                {renderSetToggle('🚨', 'Auto-SOS if no response', 'autoSosNoResponse')}
+                {renderSetNav('⌛', 'Stationary timeout', () => Alert.alert('Stationary timeout', 'RESCUEN checks on you after 3 minutes of no movement.'), { value: '3 min' })}
+              </>)}
+
+              {renderSetSection('PRIVACY & SECURITY', <>
+                {renderSetNav('🔐', 'Evidence Vault', () => setCurrentScreen('Vault'))}
+                {renderSetToggle('🕶️', 'Hide my location when safe', 'hideLocationWhenSafe', "Only shares location during an active SOS")}
+                {renderSetNav('🚫', 'Ignored / dismissed alerts', () => Alert.alert('Ignored alerts', ignoredEmergencies.length ? String(ignoredEmergencies.length)+' hidden' : 'None'))}
+                {renderSetNav('📜', 'Privacy policy', () => Linking.openURL('https://sites.google.com/view/rescuen-app-policy/home'))}
+                {renderSetNav('🧾', 'Terms & conditions', () => setCurrentScreen('ReadTC'))}
+              </>)}
+
+              {renderSetSection('NOTIFICATIONS', <>
+                {renderSetToggle('📡', 'Nearby emergency alerts', 'nearbyAlerts')}
+                {renderSetToggle('🌅', 'Daily safety tip', 'dailyTip')}
+                {renderSetToggle('🔔', 'Notification sound', 'notifSound')}
+                {renderSetToggle('📳', 'Notification vibration', 'notifVibration')}
+                {renderSetToggle('⭐', 'Review reminder', 'reviewReminder')}
+              </>)}
+
+              {renderSetSection('LANGUAGE & REGION', <>
+                {renderSetNav('🌐', 'App & voice language', () => setShowLangModal(true), { value: getLang(userLang).name })}
+                {renderSetNav('🤖', 'AI assistant language', () => setShowLangModal(true), { value: getLang(userLang).name })}
+              </>)}
+
+              {renderSetSection('APPEARANCE', <>
+                {renderSetToggle('🌙', 'Dark mode', 'darkMode', 'Switch the app to a dark theme')}
+                {renderSetToggle('🎞️', 'Reduce motion', 'reduceMotion', 'Turn off animations like the SOS pulse')}
+              </>)}
+
+              {renderSetSection('HELP & ABOUT', <>
+                {renderSetNav('🆘', 'Contact support', () => setShowReportForm(true))}
+                {renderSetNav('⭐', 'Rate on Play Store', shareApp)}
+                {renderSetNav('📤', 'Share RESCUEN', shareApp)}
+                {renderSetNav('📸', 'Instagram', () => Linking.openURL('https://www.instagram.com/hello.officialrescuen'))}
+                {renderSetNav('💬', 'WhatsApp channel', () => Linking.openURL('https://whatsapp.com/channel/0029Vb7ZOwYJ93wNB8znbq3M'))}
+                {renderSetNav('ℹ️', 'About RESCUEN', () => Alert.alert('RESCUEN', 'The Ultimate Personal Safety Companion.\nMade with love in India. 🇮🇳'))}
+                {renderSetNav('🏷️', 'App version', () => {}, { value: '2.26.35.85' })}
+              </>)}
+
+              {renderSetSection('ACCOUNT', <>
+                {renderSetNav('🚪', 'Logout', handleLogout, { danger: true })}
+                {renderSetNav('🗑️', 'Delete account', () => setShowDeleteModal(true), { danger: true })}
+              </>)}
+
+              <View style={{height: 30}} />
+            </View>
+          )}
+
+          {currentScreen === 'Vault' && (
+            <View>
+              <View style={styles.settingsHeader}>
+                <TouchableOpacity onPress={() => setCurrentScreen('Settings')} style={{paddingVertical: 4, paddingRight: 10}}><Text style={styles.settingsBack}>‹ Back</Text></TouchableOpacity>
+                <Text style={styles.settingsTitle}>🔐 Evidence Vault</Text>
+                <View style={{width: 60}} />
+              </View>
+
+              {vaultStep === 'loading' && (<View style={styles.centerContainer}><ActivityIndicator size="large" color="#004aad" /></View>)}
+
+              {(vaultStep === 'setPin' || vaultStep === 'confirmPin') && (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>{vaultStep === 'setPin' ? 'Set Vault PIN' : 'Confirm PIN'}</Text>
+                  <Text style={{color: dark ? '#9aa5b1' : '#555', marginBottom: 18, fontWeight: 'bold', lineHeight: 20}}>{vaultStep === 'setPin' ? 'Create a 4-digit PIN to lock your private evidence. Only you will ever see it.' : 'Re-enter your PIN to confirm.'}</Text>
+                  <TextInput style={[styles.input, {textAlign: 'center', fontSize: 26, letterSpacing: 14}]} keyboardType="number-pad" secureTextEntry maxLength={4} value={vaultPin} onChangeText={(t) => setVaultPin(t.replace(/[^0-9]/g, ''))} placeholder="••••" placeholderTextColor="#ccc" />
+                  {vaultError ? <Text style={{color: '#e74c3c', fontWeight: 'bold', marginBottom: 10}}>{vaultError}</Text> : null}
+                  <TouchableOpacity style={styles.btn} onPress={vaultStep === 'setPin' ? submitSetPin : submitConfirmPin}><Text style={styles.btnText}>{vaultStep === 'setPin' ? 'NEXT' : 'CONFIRM'}</Text></TouchableOpacity>
+                </View>
+              )}
+
+              {vaultStep === 'otp' && (
+                <View style={styles.card}>
+                  {vaultOtpSuccess ? (
+                    <OtpSuccess text={"Verified & PIN saved\nsuccessfully!"} />
+                  ) : (
+                    <>
+                      <Text style={styles.cardTitle}>Verify it's you</Text>
+                      <Text style={{color: dark ? '#9aa5b1' : '#555', marginBottom: 18, fontWeight: 'bold', lineHeight: 20}}>OTP sent to +91 {user.myPhone} — it fills in automatically.</Text>
+                      <OtpInput value={vaultOtp} onChange={setVaultOtp} onComplete={() => verifyVaultOtp()} />
+                      {vaultError ? <Text style={{color: '#e74c3c', fontWeight: 'bold', marginBottom: 10, textAlign: 'center'}}>{vaultError}</Text> : null}
+                      <TouchableOpacity style={styles.btn} onPress={verifyVaultOtp}><Text style={styles.btnText}>VERIFY & SAVE PIN</Text></TouchableOpacity>
+                    </>
+                  )}
+                </View>
+              )}
+
+              {vaultStep === 'enterPin' && (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Enter Vault PIN</Text>
+                  <Text style={{color: dark ? '#9aa5b1' : '#555', marginBottom: 18, fontWeight: 'bold'}}>Enter your 4-digit PIN to view your evidence.</Text>
+                  <TextInput style={[styles.input, {textAlign: 'center', fontSize: 26, letterSpacing: 14}]} keyboardType="number-pad" secureTextEntry maxLength={4} value={vaultPin} onChangeText={(t) => setVaultPin(t.replace(/[^0-9]/g, ''))} placeholder="••••" placeholderTextColor="#ccc" onSubmitEditing={submitEnterPin} />
+                  {vaultError ? <Text style={{color: '#e74c3c', fontWeight: 'bold', marginBottom: 10}}>{vaultError}</Text> : null}
+                  <TouchableOpacity style={styles.btn} onPress={submitEnterPin}><Text style={styles.btnText}>🔓 UNLOCK</Text></TouchableOpacity>
+                </View>
+              )}
+
+              {vaultStep === 'unlocked' && (
+                <View>
+                  <View style={[styles.card, {marginBottom: 15}]}>
+                    <Text style={{fontWeight: '900', color: '#1e7e46', fontSize: 15}}>🔒 Private to you only</Text>
+                    <Text style={{color: dark ? '#9aa5b1' : '#666', fontSize: 12.5, marginTop: 5, lineHeight: 18}}>Your SOS recordings & captured evidence. No other user — not even RESCUEN staff — can open these. Stored securely under your account.</Text>
+                  </View>
+                  {vaultLoading ? <ActivityIndicator size="large" color="#004aad" style={{marginTop: 20}} /> : (
+                    vaultItems.length === 0 ? (
+                      <View style={styles.card}><Text style={{textAlign: 'center', color: dark ? '#9aa5b1' : '#888', fontWeight: 'bold', lineHeight: 20}}>No evidence yet.{"\n"}It will appear here automatically after an SOS or Follow-Me alert.</Text></View>
+                    ) : (
+                      vaultItems.map((it, idx) => {
+                        const meta = evidenceMeta(it.typeStr);
+                        return (
+                        <TouchableOpacity key={idx} style={styles.vaultItem} activeOpacity={0.75} onPress={async () => { try { const url = await it.ref.getDownloadURL(); Linking.openURL(url); } catch (e) { Alert.alert('Error', 'Could not open this file.'); } }}>
+                          <View style={{width: 46, height: 46, borderRadius: 12, backgroundColor: meta.color + (dark ? '33' : '1A'), justifyContent: 'center', alignItems: 'center', marginRight: 13}}>
+                            <Text style={{fontSize: 22}}>{meta.icon}</Text>
+                          </View>
+                          <View style={{flex: 1}}>
+                            <View style={{flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap'}}>
+                              <Text style={{fontWeight: '800', fontSize: 14.5, color: dark ? '#e6ebf1' : '#1a2233', marginRight: 8}}>{meta.label}</Text>
+                              {meta.cam ? <View style={{backgroundColor: meta.color, borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2}}><Text style={{color: '#fff', fontSize: 9.5, fontWeight: '800'}}>{meta.cam.toUpperCase()}</Text></View> : null}
+                            </View>
+                            <Text style={{fontSize: 12, color: dark ? '#9aa5b1' : '#7a8699', marginTop: 3, fontWeight: '600'}}>🕒 {fmtEvidenceTime(it.ts)}</Text>
+                          </View>
+                          <Text style={{color: '#004aad', fontWeight: '800', fontSize: 13}}>Open ›</Text>
+                        </TouchableOpacity>
+                        );
+                      })
+                    )
+                  )}
+                  <TouchableOpacity style={[styles.btn, {backgroundColor: '#34495e', marginTop: 15}]} onPress={loadEvidence}><Text style={styles.btnText}>🔄 REFRESH</Text></TouchableOpacity>
+                  <View style={{height: 30}} />
+                </View>
+              )}
             </View>
           )}
 
@@ -1618,16 +2219,19 @@ const MainApp = () => {
         </View>
       )}
 
-      {(currentScreen === 'Dashboard' || currentScreen === 'ProfileView' || currentScreen === 'AIHelp') && (
+      {(currentScreen === 'Dashboard' || currentScreen === 'ProfileView' || currentScreen === 'AIHelp' || currentScreen === 'Settings' || currentScreen === 'Vault' || currentScreen === 'Wellness') && (
         <View style={styles.footer}>
           <TouchableOpacity style={[styles.tab, currentScreen==='Dashboard' && styles.tabActive]} onPress={() => setCurrentScreen('Dashboard')}>
-            <Text style={[styles.tabText, currentScreen==='Dashboard' && {color:'#004aad'}]}>🏠 HOME</Text>
+            <Text numberOfLines={1} style={[styles.tabText, currentScreen==='Dashboard' && {color:'#004aad'}]}>🏠 HOME</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.tab, currentScreen==='Wellness' && styles.tabActive]} onPress={() => setCurrentScreen('Wellness')}>
+            <Text numberOfLines={1} style={[styles.tabText, currentScreen==='Wellness' && {color:'#004aad'}]}>💚 HEALTH</Text>
           </TouchableOpacity>
           <TouchableOpacity style={[styles.tab, currentScreen==='AIHelp' && styles.tabActive]} onPress={() => setCurrentScreen('AIHelp')}>
-            <Text style={[styles.tabText, currentScreen==='AIHelp' && {color:'#004aad'}]}>🤖 AI HELP</Text>
+            <Text numberOfLines={1} style={[styles.tabText, currentScreen==='AIHelp' && {color:'#004aad'}]}>🤖 AI HELP</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[styles.tab, currentScreen==='ProfileView' && styles.tabActive]} onPress={() => setCurrentScreen('ProfileView')}>
-            <Text style={[styles.tabText, currentScreen==='ProfileView' && {color:'#004aad'}]}>👤 PROFILE</Text>
+          <TouchableOpacity style={[styles.tab, (currentScreen==='ProfileView'||currentScreen==='Settings'||currentScreen==='Vault') && styles.tabActive]} onPress={() => setCurrentScreen('ProfileView')}>
+            <Text numberOfLines={1} style={[styles.tabText, (currentScreen==='ProfileView'||currentScreen==='Settings'||currentScreen==='Vault') && {color:'#004aad'}]}>👤 PROFILE</Text>
           </TouchableOpacity>
 
           {/* 🔥 SECRET GOD MODE TAB (ONLY FOR ADMIN) 🔥 */}
@@ -1639,10 +2243,11 @@ const MainApp = () => {
         </View>
       )}
 
-      <Modal visible={isSOSActive} transparent animationType="fade">
-        <View style={[styles.modalBg, {backgroundColor: 'rgba(231, 76, 60, 0.95)', paddingTop: insets.top, paddingBottom: insets.bottom}]}>
-          <Text style={{fontSize: 28, fontWeight: '900', color: '#ffffff', marginBottom: 10, textAlign: 'center'}}>🚨 SOS ACTIVE 🚨</Text>
-          
+      <Modal visible={isSOSActive || safeTest} transparent animationType="fade">
+        <View style={[styles.modalBg, {backgroundColor: safeTest ? 'rgba(41, 128, 185, 0.96)' : 'rgba(231, 76, 60, 0.95)', paddingTop: insets.top, paddingBottom: insets.bottom}]}>
+          <Text style={{fontSize: 28, fontWeight: '900', color: '#ffffff', marginBottom: 10, textAlign: 'center'}}>{safeTest ? '🧪 SAFE TEST' : '🚨 SOS ACTIVE 🚨'}</Text>
+          {safeTest ? <Text style={{fontSize: 13, fontWeight: '800', color: '#fff', marginBottom: 12, textAlign: 'center', backgroundColor: 'rgba(0,0,0,0.25)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20}}>No alert is sent to anyone — evidence recording only</Text> : null}
+
           <View style={{width: '95%', height: Dimensions.get('window').height * 0.40, borderRadius: 15, overflow: 'hidden', marginBottom: 15, borderWidth: 3, borderColor: '#fff'}}>
             {currentCoords ? (
                <MapView provider={PROVIDER_GOOGLE} style={{flex: 1}} initialRegion={{latitude: currentCoords.latitude, longitude: currentCoords.longitude, latitudeDelta: 0.015, longitudeDelta: 0.015}}>
@@ -1672,14 +2277,25 @@ const MainApp = () => {
           </View>
 
           <View style={{backgroundColor: '#ffffff', padding: 15, borderRadius: 15, width: '95%', marginBottom: 20, elevation: 10}}>
-            <Text style={{fontSize: 16, fontWeight: '900', color: '#e74c3c', textAlign: 'center', marginBottom: 10}}>📡 BROADCAST STATUS</Text>
-            <Text style={styles.statusText}>✅ 1 KM radar scanning live</Text>
-            <Text style={styles.statusText}>✅ Family SMS sent silently</Text>
-            <Text style={styles.statusText}>✅ Police (100) alerted</Text>
+            <Text style={{fontSize: 16, fontWeight: '900', color: safeTest ? '#2980b9' : '#e74c3c', textAlign: 'center', marginBottom: 10}}>{safeTest ? '🧪 TEST STATUS' : '📡 BROADCAST STATUS'}</Text>
+            {safeTest ? (
+              <>
+                <Text style={styles.statusText}>{settings.videoEvidence ? '✅ Recording audio + video (rear ↔ front)' : '⚠️ Video evidence is OFF'}</Text>
+                <Text style={styles.statusText}>🔒 Saving to your private Evidence Vault</Text>
+                <Text style={styles.statusText}>🚫 No SMS / broadcast sent</Text>
+              </>
+            ) : (
+              <>
+                <Text style={styles.statusText}>✅ 1 KM radar scanning live</Text>
+                <Text style={styles.statusText}>✅ Family SMS sent silently</Text>
+                {settings.autoAlertPolice ? <Text style={styles.statusText}>✅ Emergency SMS sent (112)</Text> : null}
+                <Text style={styles.statusText}>{settings.videoEvidence ? '✅ Recording audio + video evidence' : '✅ Recording audio evidence'}</Text>
+              </>
+            )}
           </View>
 
-          <TouchableOpacity style={styles.deactivateBtn} onPress={deactivateSOS}>
-            <Text style={{color: '#ffffff', fontSize: 18, fontWeight: '900', letterSpacing: 1}}>🛑 DEACTIVATE ALARM</Text>
+          <TouchableOpacity style={[styles.deactivateBtn, safeTest && {backgroundColor: '#2980b9', borderColor: '#fff'}]} onPress={() => { if (safeTest) { setSafeTest(false); } else { deactivateSOS(); } }}>
+            <Text style={{color: '#ffffff', fontSize: 18, fontWeight: '900', letterSpacing: 1}}>{safeTest ? '✅ END TEST' : '🛑 DEACTIVATE ALARM'}</Text>
           </TouchableOpacity>
         </View>
       </Modal>
@@ -1809,7 +2425,7 @@ const MainApp = () => {
         <View style={[styles.modalBg, {paddingTop: insets.top, paddingBottom: insets.bottom}]}>
           <View style={[styles.card, {width: '90%'}]}>
             <Text style={[styles.cardTitle, {color: '#e74c3c'}]}>Delete Account?</Text>
-            <Text style={{fontSize: 14, color: '#444', marginBottom: 20, lineHeight: 22}}>Your account will be suspended and scheduled for permanent deletion after 30 days. To cancel this request later, simply log back in within 30 days.{"\n\n"}Type <Text style={{fontWeight: 'bold', color: '#e74c3c'}}>DELETE</Text> below to confirm.</Text>
+            <Text style={{fontSize: 14, color: dark ? '#c3ccd6' : '#444', marginBottom: 20, lineHeight: 22}}>Your account will be suspended and scheduled for permanent deletion after 30 days. To cancel this request later, simply log back in within 30 days.{"\n\n"}Type <Text style={{fontWeight: 'bold', color: '#e74c3c'}}>DELETE</Text> below to confirm.</Text>
             <TextInput style={[styles.input, {borderColor: '#e74c3c', borderWidth: 2}]} placeholder="Type DELETE here" placeholderTextColor="#888888" value={deleteInputText} onChangeText={setDeleteInputText} autoCapitalize="characters" />
             <View style={{flexDirection: 'row', justifyContent: 'space-between', marginTop: 20}}>
               <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#888', marginTop: 0}]} onPress={() => { setShowDeleteModal(false); setDeleteInputText(''); }}><Text style={styles.btnText}>CANCEL</Text></TouchableOpacity>
@@ -1822,36 +2438,62 @@ const MainApp = () => {
       <Modal visible={showEditModal} transparent animationType="fade">
         <View style={[styles.modalBg, {paddingTop: insets.top, paddingBottom: insets.bottom}]}>
           <View style={[styles.card, {width: '90%'}]}>
-            <Text style={styles.cardTitle}>Edit Numbers</Text>
-            <Text style={{fontSize: 13, color: '#e74c3c', marginBottom: 15, fontWeight: 'bold'}}>Note: Numbers can only be changed once every 60 days.</Text>
-            
-            <Text style={styles.label}>MY PHONE</Text>
-            <TextInput style={styles.input} value={editData.myPhone} placeholder="10-digit number" placeholderTextColor="#888888" keyboardType="numeric" maxLength={10} onChangeText={(t) => setEditData({...editData, myPhone: t})} />
+            {editOtpStep === 'otp' ? (
+              <>
+                <Text style={styles.cardTitle}>Verify New Number</Text>
+                <Text style={{color: dark ? '#9aa5b1' : '#555', marginBottom: 16, fontWeight: 'bold', lineHeight: 20}}>OTP sent to +91 {editData.myPhone} — it fills in automatically.</Text>
+                <OtpInput value={editOtp} onChange={setEditOtp} onComplete={() => verifyEditOtp()} />
+                {editError ? <Text style={{color: '#e74c3c', fontWeight: 'bold', marginBottom: 10, textAlign: 'center'}}>{editError}</Text> : null}
+                <View style={{flexDirection: 'row', justifyContent: 'space-between', marginTop: 6}}>
+                  <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#888', marginTop: 0}]} onPress={() => { setEditOtpStep('form'); setEditError(''); }}><Text style={styles.btnText}>BACK</Text></TouchableOpacity>
+                  <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#2ecc71', marginTop: 0}]} onPress={verifyEditOtp} disabled={isLoading}>{isLoading ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnText}>VERIFY</Text>}</TouchableOpacity>
+                </View>
+              </>
+            ) : (
+              <>
+                <Text style={styles.cardTitle}>Edit Emergency Contacts</Text>
+                <Text style={{fontSize: 12.5, color: '#e74c3c', marginBottom: 14, fontWeight: 'bold', lineHeight: 18}}>Family numbers: add / edit / remove anytime. Your OWN number: OTP-verified & changeable once every 60 days.</Text>
 
-            <ScrollView style={{maxHeight: 180}}>
-              <Text style={styles.label}>FAMILY CONTACTS</Text>
-              {editData.familyNumbers.map((num, index) => (
-                <TextInput 
-                  key={index}
-                  style={styles.input} 
-                  value={num} 
-                  placeholder={index === 0 ? "Mandatory 10-digit number" : "Optional 10-digit number"} 
-                  placeholderTextColor="#888888" 
-                  keyboardType="numeric" 
-                  maxLength={10} 
-                  onChangeText={(t) => handleEditFamilyNumChange(t, index)} 
-                />
-              ))}
-            </ScrollView>
-            
-            <View style={{flexDirection: 'row', justifyContent: 'space-between', marginTop: 10}}>
-              <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#888', marginTop: 0}]} onPress={() => setShowEditModal(false)}>
-                <Text style={styles.btnText}>CANCEL</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#2ecc71', marginTop: 0}]} onPress={saveEditedNumbers} disabled={isLoading}>
-                {isLoading ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.btnText}>SAVE</Text>}
-              </TouchableOpacity>
-            </View>
+                <Text style={styles.label}>MY PHONE (verified)</Text>
+                <TextInput style={styles.input} value={editData.myPhone} placeholder="10-digit number" placeholderTextColor="#888888" keyboardType="numeric" maxLength={10} onChangeText={(t) => setEditData({...editData, myPhone: t.replace(/[^0-9]/g, '').slice(0, 10)})} />
+
+                <ScrollView style={{maxHeight: 210}}>
+                  <Text style={styles.label}>FAMILY CONTACTS (1 required, up to 5)</Text>
+                  {editData.familyNumbers.map((num, index) => (
+                    <View key={index} style={{flexDirection: 'row', alignItems: 'center'}}>
+                      <TextInput
+                        style={[styles.input, {flex: 1, marginBottom: 10}]}
+                        value={num}
+                        placeholder={index === 0 ? "Mandatory 10-digit number" : "Optional 10-digit number"}
+                        placeholderTextColor="#888888"
+                        keyboardType="numeric"
+                        maxLength={10}
+                        onChangeText={(t) => handleEditFamilyNumChange(t, index)}
+                      />
+                      {index > 0 && (
+                        <TouchableOpacity onPress={() => removeEditFamilyNumber(index)} style={{padding: 12, marginLeft: 4}}>
+                          <Text style={{color: '#e74c3c', fontWeight: 'bold', fontSize: 20}}>✕</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  ))}
+                  {editData.familyNumbers.length < 5 && (
+                    <TouchableOpacity onPress={addEditFamilyNumber} style={{alignItems: 'flex-start', marginBottom: 8}}>
+                      <Text style={{color: '#3498db', fontWeight: 'bold', fontSize: 13}}>+ ADD ANOTHER NUMBER</Text>
+                    </TouchableOpacity>
+                  )}
+                </ScrollView>
+
+                <View style={{flexDirection: 'row', justifyContent: 'space-between', marginTop: 10}}>
+                  <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#888', marginTop: 0}]} onPress={() => setShowEditModal(false)}>
+                    <Text style={styles.btnText}>CANCEL</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.btn, {flex: 0.45, backgroundColor: '#2ecc71', marginTop: 0}]} onPress={saveEditedNumbers} disabled={isLoading}>
+                    {isLoading ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.btnText}>SAVE</Text>}
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
           </View>
         </View>
       </Modal>
@@ -1860,13 +2502,16 @@ const MainApp = () => {
       <Modal visible={showSafeCheck && !isSOSActive} transparent animationType="fade">
         <View style={[styles.modalBg, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
           <View style={[styles.card, { width: '90%', borderColor: '#e74c3c', borderWidth: 2 }]}>
-            <Text style={{ fontSize: 24, fontWeight: '900', color: '#e74c3c', textAlign: 'center', marginBottom: 10 }}>⚠️ ARE YOU SAFE?</Text>
-            <Text style={{ fontSize: 15, color: '#333', textAlign: 'center', marginBottom: 20, lineHeight: 22, fontWeight: 'bold' }}>
-              You've been stopped for a while. Tap "I'M SAFE" now — otherwise RESCUEN will auto-trigger SOS to keep you protected.
+            <Text style={{ fontSize: 24, fontWeight: '900', color: '#e74c3c', textAlign: 'center', marginBottom: 12 }}>⚠️ ARE YOU SAFE?</Text>
+            <View style={{ alignSelf: 'center', width: 96, height: 96, borderRadius: 48, borderWidth: 5, borderColor: safeCheckCountdown <= 10 ? '#e74c3c' : '#f39c12', justifyContent: 'center', alignItems: 'center', marginBottom: 14 }}>
+              <Text style={{ fontSize: 40, fontWeight: '900', color: safeCheckCountdown <= 10 ? '#e74c3c' : '#f39c12' }}>{safeCheckCountdown}</Text>
+            </View>
+            <Text style={{ fontSize: 15, color: dark ? '#e6ebf1' : '#333', textAlign: 'center', marginBottom: 20, lineHeight: 22, fontWeight: 'bold' }}>
+              You've been stopped for a while. SOS auto-activates in {safeCheckCountdown}s. Tap "I'M SAFE" to cancel.
             </Text>
             <TouchableOpacity
               style={[styles.btn, { backgroundColor: '#2ecc71', height: 60 }]}
-              onPress={() => { try { SafeJourneyEngine.dismissWarning(); } catch (e) {} setShowSafeCheck(false); }}
+              onPress={() => { try { SafeJourneyEngine.dismissWarning(); } catch (e) {} setShowSafeCheck(false); setFollowMeStationarySec(0); followMeRefPos.current = lastCoordsRef.current; followMeMoveCount.current = 0; }}
             >
               <Text style={styles.btnText}>✅ I'M SAFE</Text>
             </TouchableOpacity>
@@ -1876,6 +2521,23 @@ const MainApp = () => {
             >
               <Text style={styles.btnText}>🚨 I NEED HELP NOW</Text>
             </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Language picker */}
+      <Modal visible={showLangModal} transparent animationType="fade" onRequestClose={() => setShowLangModal(false)}>
+        <View style={[styles.modalBg, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+          <View style={[styles.card, { width: '88%' }]}>
+            <Text style={styles.cardTitle}>Choose Language</Text>
+            <Text style={{ color: dark ? '#9aa5b1' : '#666', marginBottom: 12, fontWeight: 'bold', lineHeight: 19 }}>The app, AI assistant and the safety voice will use this language.</Text>
+            {LANGS.map(l => (
+              <TouchableOpacity key={l.code} style={[styles.langRow, userLang === l.code && styles.langRowActive]} onPress={() => updateLang(l.code)}>
+                <Text style={[styles.langName, userLang === l.code && { color: '#004aad', fontWeight: '900' }]}>{l.name}</Text>
+                {userLang === l.code ? <Text style={{ color: '#004aad', fontWeight: '900', fontSize: 16 }}>✓</Text> : null}
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={[styles.btn, { backgroundColor: '#888', marginTop: 14 }]} onPress={() => setShowLangModal(false)}><Text style={styles.btnText}>CLOSE</Text></TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -1971,24 +2633,22 @@ const MainApp = () => {
                 style={[styles.btn, { flex: 0.45, backgroundColor: '#004aad', marginTop: 0 }]} 
                 disabled={isSendingReport}
                 onPress={async () => {
-                  if (!reportData.name.trim() || !reportData.email.trim() || !reportData.phone.trim() || !reportData.message.trim()) {
-                    return Alert.alert("Required Fields", "Please fill all the boxes to send a report.");
-                  }
-                  if (reportData.phone.length !== 10) {
-                    return Alert.alert("Invalid Phone", "Please enter a valid 10-digit phone number.");
+                  // Only the essentials — don't strictly validate the number/email.
+                  if (!reportData.name.trim() || !reportData.email.trim() || !reportData.message.trim()) {
+                    return Alert.alert("Required Fields", "Please enter your name, email and message.");
                   }
 
                   setIsSendingReport(true);
                   try {
                     const sendReportEmail = functions().httpsCallable('sendSupportEmail');
                     const response = await sendReportEmail(reportData);
-                    
+
                     if (response.data && response.data.success) {
-                      Alert.alert("Sent Successfully", "Your message has been sent to our team. We will get back to you soon.");
+                      Alert.alert("Message Sent ✅", "Thank you! Our team has received your message and will get back to you within 1–2 working days. A confirmation has been emailed to you.");
                       setShowReportForm(false);
                       setReportData({ name: '', email: '', phone: '', message: '' });
                     } else {
-                      Alert.alert("Error", "Could not send the message. Please try again.");
+                      Alert.alert("Couldn't Send", (response.data && response.data.error) === 'Email support is not configured yet.' ? "Support email isn't set up yet. Please try again later." : "Could not send the message. Please try again.");
                     }
                   } catch (error) {
                     Alert.alert("Network Error", "Please check your internet connection.");
@@ -2008,45 +2668,63 @@ const MainApp = () => {
   );
 };
 
-const styles = StyleSheet.create({
-  main: { flex: 1, backgroundColor: '#ffffff' }, 
-  header: { height: 72, backgroundColor: '#ffffff', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, elevation: 6, zIndex: 10, width: '100%', shadowColor: '#0a2540', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.10, shadowRadius: 10, borderBottomWidth: 0.5, borderBottomColor: '#eef1f5' },
+const makeStyles = (dark) => {
+  // Color tokens. Light values are IDENTICAL to the original design so light
+  // mode looks exactly as before; dark values are the night-mode equivalents.
+  const C = dark ? {
+    screen: '#0b1016', content: '#0b1016', card: '#161d26', card2: '#1e2732',
+    border: '#2a3542', divider: '#243040', text: '#e6ebf1', title: '#f5f8fc', sub: '#9aa5b1',
+    input: '#1a222c', inputBorder: '#33404e', header: '#12181f', footer: '#12181f',
+    tabActive: '#1c2a3f', chip: '#1a222c', tcBg: '#12181f', tcBorder: '#2a3542',
+  } : {
+    screen: '#ffffff', content: '#f4f7f6', card: '#ffffff', card2: '#f9f9f9',
+    border: '#eef1f5', divider: '#eef1f5', text: '#1a2233', title: '#0a2540', sub: '#8a94a6',
+    input: '#ffffff', inputBorder: '#cccccc', header: '#ffffff', footer: '#ffffff',
+    tabActive: '#eef3ff', chip: '#ffffff', tcBg: '#f9f9f9', tcBorder: '#eeeeee',
+  };
+  return StyleSheet.create({
+  main: { flex: 1, backgroundColor: C.screen },
+  header: { height: 72, backgroundColor: C.header, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, elevation: 6, zIndex: 10, width: '100%', shadowColor: '#0a2540', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.10, shadowRadius: 10, borderBottomWidth: 0.5, borderBottomColor: C.divider },
   logo: { width: 40, height: 40, marginRight: 15, borderRadius: 5 },
   headerTitle: { fontSize: 24, fontWeight: '900', color: '#004aad', letterSpacing: 1 },
   headerIconsContainer: { flex: 1, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center' },
   socialIcon: { width: 28, height: 28, marginLeft: 20 },
-  scrollContent: { padding: 20, flexGrow: 1, justifyContent: 'flex-start', backgroundColor: '#f4f7f6' }, 
+  scrollContent: { padding: 20, flexGrow: 1, justifyContent: 'flex-start', backgroundColor: C.content },
   centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 100 }, 
   warningBox: { width: '100%', backgroundColor: '#ffeaa7', padding: 15, borderRadius: 10, borderWidth: 1, borderColor: '#f1c40f', marginBottom: 20, alignItems: 'center' },
   warningText: { color: '#d35400', fontWeight: 'bold', textAlign: 'center', fontSize: 13, lineHeight: 20 },
-  card: { backgroundColor: '#ffffff', padding: 25, borderRadius: 22, elevation: 5, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.08, shadowRadius: 18 },
-  cardTitle: { fontSize: 26, fontWeight: '800', marginBottom: 5, color: '#000000' },
-  label: { fontSize: 12, color: '#555555', marginBottom: 8, fontWeight: 'bold', marginTop: 10 }, 
-  input: { backgroundColor: '#ffffff', height: 55, borderRadius: 12, paddingHorizontal: 20, borderWidth: 1, borderColor: '#cccccc', marginBottom: 15, fontSize: 15, color: '#000000', fontWeight: 'bold' },
+  card: { backgroundColor: C.card, padding: 25, borderRadius: 22, elevation: 5, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.08, shadowRadius: 18 },
+  cardTitle: { fontSize: 26, fontWeight: '800', marginBottom: 5, color: C.title },
+  label: { fontSize: 12, color: C.sub, marginBottom: 8, fontWeight: 'bold', marginTop: 10 },
+  input: { backgroundColor: C.input, height: 55, borderRadius: 12, paddingHorizontal: 20, borderWidth: 1, borderColor: C.inputBorder, marginBottom: 15, fontSize: 15, color: C.text, fontWeight: 'bold' },
   genderRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 25 },
-  gBtn: { flex: 1, padding: 15, borderWidth: 1, borderColor: '#cccccc', borderRadius: 12, alignItems: 'center', marginHorizontal: 4, backgroundColor: '#ffffff' },
+  gBtn: { flex: 1, padding: 15, borderWidth: 1, borderColor: C.inputBorder, borderRadius: 12, alignItems: 'center', marginHorizontal: 4, backgroundColor: C.input },
   gActive: { backgroundColor: '#004aad', borderColor: '#004aad' },
-  gText: { fontWeight: 'bold', color: '#333333' }, 
+  gText: { fontWeight: 'bold', color: C.text },
   btn: { backgroundColor: '#004aad', padding: 18, borderRadius: 14, alignItems: 'center', elevation: 3, marginTop: 10, shadowColor: '#004aad', shadowOffset: { width: 0, height: 5 }, shadowOpacity: 0.28, shadowRadius: 10 },
   btnText: { color: '#ffffff', fontSize: 16, fontWeight: '800', letterSpacing: 1 },
-  tcBox: { height: 180, backgroundColor: '#f9f9f9', padding: 15, borderRadius: 12, marginBottom: 20, borderWidth: 1.5, borderColor: '#eeeeee' },
-  tcText: { fontSize: 13, color: '#333333', lineHeight: 22 },
+  tcBox: { height: 180, backgroundColor: C.tcBg, padding: 15, borderRadius: 12, marginBottom: 20, borderWidth: 1.5, borderColor: C.tcBorder },
+  tcText: { fontSize: 13, color: C.text, lineHeight: 22 },
   checkRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 25, alignSelf: 'center', marginTop: 15 },
-  checkbox: { width: 22, height: 22, borderWidth: 2, borderColor: '#004aad', borderRadius: 6, marginRight: 12, backgroundColor: '#ffffff' },
+  checkbox: { width: 22, height: 22, borderWidth: 2, borderColor: '#004aad', borderRadius: 6, marginRight: 12, backgroundColor: C.input },
   checked: { backgroundColor: '#004aad' },
   checkLabel: { fontSize: 13, fontWeight: 'bold', color: '#004aad' },
-  sosContainer: { alignItems: 'center', marginTop: 20, backgroundColor: '#f4f7f6', flex: 1 },
-  mapBox: { width: '100%', padding: 20, backgroundColor: '#ffffff', borderRadius: 18, marginBottom: 26, alignItems: 'center', elevation: 4, borderWidth: 1, borderColor: '#eef1f5', shadowColor: '#0a2540', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.08, shadowRadius: 14 },
+  sosContainer: { alignItems: 'center', marginTop: 20, backgroundColor: C.content, flex: 1 },
+  mapBox: { width: '100%', padding: 20, backgroundColor: C.card, borderRadius: 18, marginBottom: 26, alignItems: 'center', elevation: 4, borderWidth: 1, borderColor: C.border, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.08, shadowRadius: 14 },
   mapText: { fontSize: 18, fontWeight: 'bold', color: '#2ecc71' },
-  locationSubText: { fontSize: 13, color: '#000000', marginTop: 8, fontWeight: 'bold', textAlign: 'center' },
+  locationSubText: { fontSize: 13, color: C.text, marginTop: 8, fontWeight: 'bold', textAlign: 'center' },
   panicWrap: { justifyContent: 'center', alignItems: 'center', marginTop: 10 },
   panicPulse: { position: 'absolute', width: 240, height: 240, borderRadius: 120, backgroundColor: '#e74c3c' },
   panicBtn: { backgroundColor: '#e74c3c', width: 240, height: 240, borderRadius: 120, justifyContent: 'center', alignItems: 'center', elevation: 20, borderWidth: 10, borderColor: 'rgba(231, 76, 60, 0.25)', shadowColor: '#e74c3c', shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.5, shadowRadius: 24 },
   panicText: { color: '#ffffff', fontSize: 60, fontWeight: '900', letterSpacing: 2 },
   panicHint: { color: 'rgba(255,255,255,0.9)', fontSize: 14, fontWeight: '800', letterSpacing: 3, marginTop: 2 },
-  followBtn: { width: '100%', backgroundColor: '#ffffff', borderWidth: 1.5, borderColor: '#004aad', borderRadius: 14, paddingVertical: 15, alignItems: 'center', marginBottom: 24, elevation: 2 },
-  followBtnActive: { backgroundColor: '#004aad', borderColor: '#004aad' },
+  followBtn: { width: '100%', backgroundColor: C.card, borderWidth: 1.5, borderColor: '#004aad', borderRadius: 14, paddingVertical: 15, alignItems: 'center', marginBottom: 24, elevation: 2 },
+  followBtnActive: { backgroundColor: '#2ecc71', borderColor: '#27ae60' },
   followBtnText: { color: '#004aad', fontWeight: '800', fontSize: 14, letterSpacing: 0.5 },
+  followStatus: { width: '100%', backgroundColor: C.card, borderRadius: 14, padding: 16, marginBottom: 20, alignItems: 'center', borderWidth: 1.5, borderColor: C.border, elevation: 2 },
+  followStatusText: { fontSize: 14, fontWeight: '800', color: C.text },
+  followTimer: { fontSize: 34, fontWeight: '900', color: '#004aad', marginVertical: 4 },
+  followStatusSub: { fontSize: 11.5, color: C.sub, textAlign: 'center', marginTop: 2, lineHeight: 16 },
   fakeCallBtn: { backgroundColor: '#2c3e50', borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginBottom: 18, marginHorizontal: 5, elevation: 2 },
   fakeCallBtnText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
   callScreen: { flex: 1, backgroundColor: '#111417', justifyContent: 'space-between', paddingVertical: 60 },
@@ -2056,30 +2734,66 @@ const styles = StyleSheet.create({
   callActions: { flexDirection: 'row', justifyContent: 'space-evenly', alignItems: 'center', marginBottom: 40 },
   callCircle: { width: 74, height: 74, borderRadius: 37, justifyContent: 'center', alignItems: 'center', elevation: 6 },
   callCircleIcon: { color: '#ffffff', fontSize: 30 },
-  instruction: { marginTop: 30, color: '#444444', fontWeight: 'bold', letterSpacing: 1, textAlign: 'center' },
-  footer: { height: 72, backgroundColor: '#ffffff', flexDirection: 'row', borderTopWidth: 0.5, borderColor: '#eef1f5', elevation: 12, shadowColor: '#0a2540', shadowOffset: { width: 0, height: -3 }, shadowOpacity: 0.06, shadowRadius: 10 },
+  profileHero: { alignItems: 'center', backgroundColor: C.card, borderRadius: 22, paddingVertical: 28, paddingHorizontal: 20, elevation: 5, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.08, shadowRadius: 18 },
+  profileAvatar: { width: 92, height: 92, borderRadius: 46, backgroundColor: '#eef3ff', justifyContent: 'center', alignItems: 'center', borderWidth: 3, borderColor: '#004aad', marginBottom: 12, overflow: 'hidden' },
+  avatarCam: { position: 'absolute', bottom: 0, right: 0, backgroundColor: '#004aad', width: 28, height: 28, borderRadius: 14, justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#fff' },
+  profileName: { fontSize: 22, fontWeight: '900', color: C.title },
+  profileEmail: { fontSize: 13, color: C.sub, marginTop: 3 },
+  profileBadge: { marginTop: 12, backgroundColor: '#e8f8f0', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 6, borderWidth: 1, borderColor: '#b7e4c7' },
+  profileBadgeText: { color: '#1e7e46', fontWeight: 'bold', fontSize: 12 },
+  profileStatsRow: { flexDirection: 'row', backgroundColor: C.card, borderRadius: 18, paddingVertical: 16, marginTop: 14, elevation: 3, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.06, shadowRadius: 10, alignItems: 'center' },
+  profileStat: { flex: 1, alignItems: 'center' },
+  profileStatNum: { fontSize: 18, fontWeight: '900', color: '#004aad' },
+  profileStatLabel: { fontSize: 11, color: C.sub, marginTop: 2, fontWeight: 'bold' },
+  profileStatDivider: { width: 1, height: 30, backgroundColor: C.divider },
+  settingsHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  settingsBack: { color: '#004aad', fontWeight: 'bold', fontSize: 16 },
+  settingsTitle: { fontSize: 22, fontWeight: '900', color: C.title },
+  setSection: { marginBottom: 18 },
+  setSectionTitle: { fontSize: 12, fontWeight: '900', color: C.sub, letterSpacing: 1, marginBottom: 8, marginLeft: 6 },
+  setSectionCard: { backgroundColor: C.card, borderRadius: 16, elevation: 2, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 10 },
+  setRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14, paddingHorizontal: 14, borderBottomWidth: 0.5, borderBottomColor: C.divider },
+  setLabel: { fontSize: 14.5, color: C.text, fontWeight: '600' },
+  setDesc: { fontSize: 11.5, color: C.sub, marginTop: 3 },
+  setArrow: { fontSize: 15, color: C.sub, fontWeight: 'bold' },
+  vaultItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderRadius: 14, padding: 16, marginBottom: 10, elevation: 2, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.05, shadowRadius: 8 },
+  langRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14, paddingHorizontal: 16, borderRadius: 12, borderWidth: 1.5, borderColor: C.border, marginBottom: 8 },
+  langRowActive: { borderColor: '#004aad', backgroundColor: dark ? '#1c2a3f' : '#eef3ff' },
+  langName: { fontSize: 16, color: C.text, fontWeight: '600' },
+  langChip: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 20, borderWidth: 1.5, borderColor: C.inputBorder, marginRight: 8, marginBottom: 8, backgroundColor: C.chip },
+  langChipActive: { backgroundColor: '#004aad', borderColor: '#004aad' },
+  langChipText: { color: C.text, fontWeight: 'bold', fontSize: 13 },
+  otpBox: { width: 46, height: 56, borderRadius: 12, borderWidth: 2, borderColor: '#d0d5dd', backgroundColor: '#f8fafc', justifyContent: 'center', alignItems: 'center' },
+  otpBoxFilled: { borderColor: '#004aad', backgroundColor: '#eef3ff' },
+  otpBoxActive: { borderColor: '#004aad' },
+  otpDigit: { fontSize: 24, fontWeight: '900', color: '#004aad' },
+  instruction: { marginTop: 30, color: C.sub, fontWeight: 'bold', letterSpacing: 1, textAlign: 'center' },
+  footer: { height: 72, backgroundColor: C.footer, flexDirection: 'row', borderTopWidth: 0.5, borderColor: C.divider, elevation: 12, shadowColor: '#0a2540', shadowOffset: { width: 0, height: -3 }, shadowOpacity: 0.06, shadowRadius: 10 },
   tab: { flex: 1, justifyContent: 'center', alignItems: 'center', borderTopWidth: 3, borderTopColor: 'transparent' },
-  tabActive: { backgroundColor: '#eef3ff', borderTopColor: '#004aad' },
-  tabText: { fontSize: 13, fontWeight: 'bold', color: '#8a94a6' },
-  profileRow: { borderBottomWidth: 1, borderColor: '#eeeeee', paddingVertical: 15, flexDirection: 'row', justifyContent: 'space-between' },
-  profileLabel: { color: '#888888', fontWeight: 'bold', fontSize: 13 },
-  profileValue: { color: '#000000', fontWeight: 'bold', fontSize: 15 },
+  tabActive: { backgroundColor: C.tabActive, borderTopColor: '#004aad' },
+  tabText: { fontSize: 11.5, fontWeight: 'bold', color: C.sub },
+  wellCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 11, elevation: 3, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.06, shadowRadius: 10 },
+  wellTitle: { fontSize: 15.5, fontWeight: '800', color: C.text },
+  wellDesc: { fontSize: 12, color: C.sub, marginTop: 3 },
+  profileRow: { borderBottomWidth: 1, borderColor: C.divider, paddingVertical: 15, flexDirection: 'row', justifyContent: 'space-between' },
+  profileLabel: { color: C.sub, fontWeight: 'bold', fontSize: 13 },
+  profileValue: { color: C.text, fontWeight: 'bold', fontSize: 15 },
   modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  statusText: { fontSize: 14, color: '#333333', textAlign: 'center', marginBottom: 5, fontWeight: 'bold' },
+  statusText: { fontSize: 14, color: C.text, textAlign: 'center', marginBottom: 5, fontWeight: 'bold' },
   deactivateBtn: { backgroundColor: '#000000', padding: 15, borderRadius: 15, width: '100%', alignItems: 'center', borderWidth: 2, borderColor: '#ffffff', elevation: 10 },
   chatHeader: { marginBottom: 20, alignItems: 'center' },
   chatHeaderTitle: { fontSize: 22, fontWeight: 'bold', color: '#004aad' },
-  chatHeaderSub: { fontSize: 12, color: '#666', marginTop: 5 },
+  chatHeaderSub: { fontSize: 12, color: C.sub, marginTop: 5 },
   chatContainer: { flex: 1, paddingBottom: 20 },
   chatBubble: { maxWidth: '80%', padding: 15, borderRadius: 15, marginBottom: 15, elevation: 1 },
   chatBubbleUser: { backgroundColor: '#004aad', alignSelf: 'flex-end', borderBottomRightRadius: 0 },
-  chatBubbleAI: { backgroundColor: '#ffffff', alignSelf: 'flex-start', borderBottomLeftRadius: 0, borderWidth: 1, borderColor: '#e1e5eb' },
+  chatBubbleAI: { backgroundColor: C.card, alignSelf: 'flex-start', borderBottomLeftRadius: 0, borderWidth: 1, borderColor: C.border },
   chatText: { fontSize: 14, lineHeight: 22, fontWeight: '600' },
-  chatInputBox: { flexDirection: 'row', padding: 15, backgroundColor: '#ffffff', borderTopWidth: 1, borderColor: '#eee' },
-  chatInput: { flex: 1, backgroundColor: '#f4f7f6', borderRadius: 25, paddingHorizontal: 20, height: 50, color: '#000', fontWeight: 'bold' },
+  chatInputBox: { flexDirection: 'row', padding: 15, backgroundColor: C.card, borderTopWidth: 1, borderColor: C.divider },
+  chatInput: { flex: 1, backgroundColor: C.input, borderRadius: 25, paddingHorizontal: 20, height: 50, color: C.text, fontWeight: 'bold' },
   chatSendBtn: { backgroundColor: '#004aad', borderRadius: 25, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20, marginLeft: 10 },
   flipkartGridContainer: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginBottom: 20, paddingHorizontal: 5 },
-  flipkartGridBox: { width: '48%', backgroundColor: '#ffffff', borderWidth: 1, borderColor: '#dbe4f3', borderRadius: 14, paddingVertical: 18, alignItems: 'center', justifyContent: 'center', marginBottom: 10, elevation: 2, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.06, shadowRadius: 8 },
+  flipkartGridBox: { width: '48%', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 14, paddingVertical: 18, alignItems: 'center', justifyContent: 'center', marginBottom: 10, elevation: 2, shadowColor: '#0a2540', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.06, shadowRadius: 8 },
   flipkartGridText: { color: '#004aad', fontWeight: 'bold', fontSize: 14, textAlign: 'center' },
   helplineRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 18, paddingHorizontal: 5 },
   helplineBtn: { flex: 1, backgroundColor: '#fff5f5', borderWidth: 1.5, borderColor: '#e74c3c', borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginHorizontal: 4, elevation: 2 },
@@ -2091,7 +2805,10 @@ const styles = StyleSheet.create({
   loginBottomArea: { position: 'absolute', bottom: 50, width: '100%', paddingHorizontal: 30 },
   googleLoginBtn: { backgroundColor: '#ffffff', height: 60, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', elevation: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 5 },
   googleBtnText: { color: '#000000', fontSize: 18, fontWeight: 'bold' }
-});
+  });
+};
+// Light stylesheet for the pre-auth OtpInput/OtpSuccess components (always light).
+const styles = makeStyles(false);
 
 const App = () => { return (<SafeAreaProvider><MainApp /></SafeAreaProvider>); };
 

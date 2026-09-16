@@ -15,10 +15,20 @@ service firebase.storage {
       return request.auth != null;
     }
 
+    // Profile photo — owner-only read & write.
+    match /users/{userId}/profile/{allPaths=**} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow write: if isSignedIn() && request.auth.uid == userId
+                   && request.resource.size < 8 * 1024 * 1024;
+    }
+
     match /users/{userId}/evidence_vault/{allPaths=**} {
-      allow write: if isSignedIn()
+      // Owner-only: ONLY the user whose Firebase Auth uid == {userId} can read or
+      // write their own evidence. No other signed-in user, and no one on the
+      // public internet, can ever access it. This is what makes the vault private.
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow write: if isSignedIn() && request.auth.uid == userId
                    && request.resource.size < 50 * 1024 * 1024; // 50 MB cap per object
-      allow read: if false;
     }
 
     // Default deny for everything else.

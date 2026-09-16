@@ -1,11 +1,33 @@
 const { onDocumentCreated, onDocumentDeleted } = require("firebase-functions/v2/firestore");
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
+const { setGlobalOptions } = require("firebase-functions/v2");
 const admin = require("firebase-admin");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const nodemailer = require('nodemailer');
+const path = require('path');
 
 admin.initializeApp();
+
+// ---------------------------------------------------------------------------
+// SCALING / "LOAD BALANCING"
+// Cloud Functions v2 run on Cloud Run: Google's front end already load-balances
+// requests and AUTOSCALES instances up and down automatically — there is no
+// separate load balancer to add. These global defaults just set the envelope:
+//  - maxInstances 80: autoscale headroom (raise as the user base grows; guards
+//    against runaway cost from a bug/abuse spike).
+//  - concurrency 80: each warm instance serves many requests at once, so we hit
+//    far fewer cold starts and stay smooth under load.
+//  - 256MiB / 60s: enough for these light handlers.
+// The critical SOS-broadcast trigger overrides these below (kept always-warm).
+// ---------------------------------------------------------------------------
+setGlobalOptions({
+    region: "us-central1",
+    maxInstances: 80,
+    concurrency: 80,
+    memory: "256MiB",
+    timeoutSeconds: 60,
+});
 
 // ---------------------------------------------------------------------------
 // SECRETS (never hardcode credentials in source — they end up in git history).
@@ -18,6 +40,9 @@ admin.initializeApp();
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 const GMAIL_USER = defineSecret("GMAIL_USER");
 const GMAIL_APP_PASSWORD = defineSecret("GMAIL_APP_PASSWORD");
+
+// Latest Gemini flash model. Change here when a newer one ships.
+const GEMINI_MODEL = "gemini-3.8-flash";
 
 const FCM_MULTICAST_LIMIT = 500; // FCM caps sendEachForMulticast at 500 tokens/call.
 
@@ -88,7 +113,15 @@ async function logDelivery(sessionId, payload) {
 // ===========================================================================
 
 // 1. WHEN AN SOS IS RAISED -> BROADCAST TO NEARBY USERS (within 1 km)
-exports.sendEmergencyAlert = onDocumentCreated("active_emergencies/{userId}", async (event) => {
+// minInstances:0 = no always-on cost. Set to 1 (with `firebase deploy --force`)
+// to keep a worker warm so the community alert fires with zero cold-start delay
+// — that adds a small monthly bill. Device-side family SMS + siren are instant
+// regardless (they don't hit the server).
+exports.sendEmergencyAlert = onDocumentCreated(
+    // Critical path: 1 always-warm worker (zero cold-start when an SOS fires) and
+    // extra autoscale headroom so a burst of simultaneous emergencies never queues.
+    { document: "active_emergencies/{userId}", minInstances: 1, maxInstances: 200, memory: "512MiB" },
+    async (event) => {
     const snap = event.data;
     if (!snap) return;
 
@@ -159,6 +192,9 @@ exports.sendEmergencyAlert = onDocumentCreated("active_emergencies/{userId}", as
                 apns: { headers: { 'apns-priority': '10' }, payload: { aps: { 'content-available': 1 } } },
             }, tokens);
             console.log(`SOS Alert delivered to ${sent}/${tokens.length} nearby devices.`);
+            // Write the true count of people within 1 km so the victim's live
+            // metrics are accurate (not just app-open clients that self-report).
+            try { await snap.ref.update({ nearbyCount: tokens.length }); } catch (e) {}
             await logDelivery(victimEmail, { channel: 'fcm_nearby', attempted: tokens.length, delivered: sent });
         }
 
@@ -168,8 +204,8 @@ exports.sendEmergencyAlert = onDocumentCreated("active_emergencies/{userId}", as
         const victimSnap = await db.collection('users').doc(victimEmail).get();
         const familyNumbers = victimSnap.exists && Array.isArray(victimSnap.data().familyNumbers)
             ? victimSnap.data().familyNumbers : [];
-        const smsBody = `URGENT EMERGENCY: ${victimName} is in danger. Live location: ${mapLink}`;
-        const smsTargets = [...familyNumbers.filter(n => n && String(n).length === 10), '100'];
+        const smsBody = `🚨 RESCUEN EMERGENCY ALERT 🚨\n${victimName} is in danger and needs help NOW.\n📍 Live location: ${mapLink}\nPlease reach them or call the police immediately.\n\n— Sent automatically by RESCUEN Team`;
+        const smsTargets = [...familyNumbers.filter(n => n && String(n).length === 10), '112'];
         const smsResult = await sendServerSms(smsTargets, smsBody);
         await logDelivery(victimEmail, { channel: 'server_sms', configured: smsResult.configured, targets: smsTargets.length });
     } catch (error) {
@@ -237,14 +273,51 @@ exports.askGemini = onCall({ secrets: [GEMINI_API_KEY] }, async (request) => {
                 { name: "deactivate_follow_me", description: "Stops the tracking mode. Use this if the user says they have reached safely or want to stop tracking." },
             ],
         }];
-        const systemPrompt = `You are RESCUEN AI Security Manager.
-        RULES:
-        1. YOU MUST ANSWER questions about RESCUEN app features, emergency SOS, app security, and the 1KM radar.
-        2. If the user's message implies they are in danger, immediately use the 'trigger_sos' tool.
-        3. If the user wants to be monitored during a journey, use the 'activate_follow_me' tool.
-        4. SOS Data Context: ${JSON.stringify(contextData)}. Provide nearest available active SOS details if asked. NEVER reveal family numbers.`;
+        const systemPrompt = `You are the RESCUEN AI Safety Assistant — a warm, calm, reliable guide inside the RESCUEN personal-safety app. Answer accurately and briefly. Reply in the SAME language the user writes in (English, Hindi, Hinglish, Bengali, etc.).
 
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash", tools: aiTools });
+WHAT RESCUEN IS:
+A community-powered emergency app. When a user triggers SOS, RESCUEN instantly (a) sirens + vibrates, (b) silently SMSes their saved family contacts and police (100) with a live Google Maps location link, (c) broadcasts to every RESCUEN user within a 1 KM radius so nearby people can rush to help, and (d) records tamper-resistant audio evidence to a private, owner-only vault.
+
+HOW TO TRIGGER SOS (tell users all three):
+1. Hold the big red SOS button for 2 seconds on the Home screen.
+2. Triple-press the volume key (works even from a locked screen).
+3. Tell me (the AI) that you are in danger — I trigger it for you.
+
+KEY FEATURES & HOW THEY WORK:
+- 1 KM Community Radar: nearby users get a high-priority alert with the victim's live location, distance and ETA, and can tap "I am going to help". Uses geohash proximity.
+- Family + Police SMS: up to 5 family numbers + police (100), sent automatically with a live map link.
+- Follow-Me (Safe Journey): monitors your journey; if you stay stopped unexpectedly it asks "Are you safe?" and auto-triggers SOS if you don't respond.
+- Secure Evidence Vault: audio (and, where available, photos) recorded during SOS, stored privately — only the owner can access it, never other users.
+- Emergency helplines: one-tap dial 112 (all-in-one), 1091 (women), 108 (ambulance).
+- Fake Call: a decoy incoming call to help you exit an unsafe situation.
+- Verified onboarding: Google sign-in + phone OTP; emergency numbers are change-locked for 60 days to prevent tampering.
+- Privacy: location and identity are only shared during an active emergency; family numbers are never exposed to anyone.
+
+EXACT IN-APP NAVIGATION (give these precise steps — never guess):
+- The app has a bottom bar with 3 tabs: HOME, AI HELP, PROFILE.
+- Trigger SOS: HOME tab → hold the big red SOS button for 2 seconds. Or triple-press the volume key. Or tell me.
+- Evidence Vault (recordings & photos): PROFILE tab → "Settings & Privacy" → under "PRIVACY & SECURITY" tap "Evidence Vault". First time you set a 4-digit PIN and verify with an OTP; after that you enter your PIN to see ALL your own SOS audio recordings and captured photos. Only you can open it.
+- Settings: PROFILE tab → "Settings & Privacy" button.
+- Edit emergency contacts: PROFILE tab → "Edit Emergency Contacts" (or Settings → PROFILE → Edit emergency contacts). Numbers can be changed once every 60 days.
+- Follow-Me (Safe Journey): HOME tab → "Start Follow-Me" button; toggles are in Settings → "SAFE JOURNEY".
+- Emergency helplines (112 / 1091 / 108): AI HELP tab → the coloured helpline buttons.
+- Fake Call: AI HELP tab → "Fake Call" button.
+- Change language / voice language: Settings → "LANGUAGE & REGION" → "App & voice language".
+- Turn siren/vibration/countdown/flash on or off: Settings → "EMERGENCY & SOS".
+- Notifications settings: Settings → "NOTIFICATIONS".
+- Contact support / report an issue: AI HELP tab → "Report Issue / Contact Support", or Settings → "HELP & ABOUT" → Contact support.
+- Logout / Delete account: Settings → "ACCOUNT" (delete has a 30-day grace period).
+- Privacy policy / Terms: Settings → "PRIVACY & SECURITY".
+
+BEHAVIOUR RULES:
+1. Answer any question about RESCUEN's features, setup, permissions, or general personal-safety tips, clearly and correctly.
+2. If the user's message implies they are in danger, scared, being followed, or need help — immediately use the 'trigger_sos' tool.
+3. If the user wants to be tracked/monitored while travelling alone, use 'activate_follow_me'; if they say they reached safely, use 'deactivate_follow_me'.
+4. When a user asks WHERE something is or HOW to do it (e.g. "where is my evidence?"), give the EXACT navigation steps from the list above — tab by tab. Be precise; never guess a wrong location. Never invent features RESCUEN does not have; if genuinely unsure, say so and point to Settings.
+5. NEVER reveal anyone's phone number or family numbers.
+6. Context (nearby/last SOS data): ${JSON.stringify(contextData)} — use it only to answer the user's own questions; do not leak other people's private details.`;
+
+        const model = genAI.getGenerativeModel({ model: GEMINI_MODEL, tools: aiTools });
         const chat = model.startChat({
             history: [
                 { role: "user", parts: [{ text: systemPrompt }] },
@@ -271,22 +344,77 @@ exports.sendSupportEmail = onCall({ secrets: [GMAIL_USER, GMAIL_APP_PASSWORD] },
         throw new HttpsError('unauthenticated', 'You must be signed in to contact support.');
     }
     try {
+        const supportUser = process.env.GMAIL_USER;
+        const supportPass = process.env.GMAIL_APP_PASSWORD;
         const { name, email, phone, message } = request.data || {};
-        if (!name || !email || !phone || !message) {
+        // Only require the essentials — don't strictly validate the number/email.
+        if (!name || !email || !message) {
             return { success: false, error: "Missing fields" };
         }
-        const supportUser = GMAIL_USER.value();
+        if (!supportUser || !supportPass) {
+            return { success: false, error: "Email support is not configured yet." };
+        }
         const transporter = nodemailer.createTransport({
             service: 'gmail',
-            auth: { user: supportUser, pass: GMAIL_APP_PASSWORD.value() },
+            auth: { user: supportUser, pass: supportPass },
         });
+        // 1) Deliver the report to the support inbox.
         await transporter.sendMail({
             from: `"RESCUEN App" <${supportUser}>`,
             to: supportUser,
             replyTo: email,
             subject: `New Support Report from ${name}`,
-            text: `You have received a new support message from the RESCUEN App.\n\nUSER DETAILS\n------------\nName:  ${name}\nEmail: ${email}\nPhone: ${phone}\n\nMESSAGE\n-------\n${message}\n`,
+            text: `You have received a new support message from the RESCUEN App.\n\nUSER DETAILS\n------------\nName:  ${name}\nEmail: ${email}\nPhone: ${phone || 'N/A'}\n\nMESSAGE\n-------\n${message}\n`,
         });
+        // 2) Send the user a rich, professional auto-acknowledgement that quotes
+        //    their own message back and carries the RESCUEN logo (small, inline).
+        try {
+            const esc = (s) => String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const safeMsg = esc(message).replace(/\r?\n/g, '<br>');
+            const html = `
+<div style="margin:0;padding:0;background:#f4f7f6;">
+  <div style="max-width:600px;margin:0 auto;font-family:Arial,Helvetica,sans-serif;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e6ebf1;">
+    <div style="background:#004aad;padding:18px 24px;text-align:center;">
+      <img src="cid:rescuenlogo" width="42" height="42" alt="RESCUEN" style="border-radius:10px;vertical-align:middle;display:inline-block;" />
+      <span style="color:#ffffff;font-size:22px;font-weight:800;letter-spacing:1px;vertical-align:middle;margin-left:10px;">RESCUEN</span>
+    </div>
+    <div style="padding:28px 24px;color:#1a2233;">
+      <h2 style="margin:0 0 8px;font-size:20px;color:#0a2540;">Hi ${esc(name)}, we've got your message ✅</h2>
+      <p style="font-size:14px;line-height:22px;color:#444444;margin:0 0 18px;">
+        Thank you for reaching out to <b>RESCUEN Support</b>. Your message has reached our team and we're already looking into it. You can expect a personal reply within <b>1–2 working days</b>.
+      </p>
+      <div style="background:#f4f7f6;border-left:4px solid #004aad;border-radius:8px;padding:14px 16px;margin:0 0 18px;">
+        <p style="font-size:11px;font-weight:bold;color:#8a94a6;margin:0 0 8px;text-transform:uppercase;letter-spacing:1px;">Your message to us</p>
+        <p style="font-size:14px;line-height:22px;color:#1a2233;margin:0;">${safeMsg}</p>
+      </div>
+      <div style="background:#fff5f5;border:1px solid #f5b7b1;border-radius:8px;padding:14px 16px;margin:0 0 20px;">
+        <p style="font-size:13px;line-height:20px;color:#c0392b;margin:0;font-weight:bold;">
+          ⚠️ If you are in immediate danger, use the SOS button in the RESCUEN app or call your local emergency number right now — please don't wait for this email.
+        </p>
+      </div>
+      <p style="font-size:14px;line-height:22px;color:#444444;margin:0 0 2px;">Stay safe,</p>
+      <p style="font-size:14px;line-height:22px;color:#0a2540;margin:0;font-weight:bold;">Team RESCUEN</p>
+    </div>
+    <div style="background:#0a2540;padding:16px 24px;text-align:center;">
+      <p style="font-size:11px;color:#9aa5b1;margin:0 0 4px;">RESCUEN — Women's safety, reimagined.</p>
+      <p style="font-size:11px;color:#9aa5b1;margin:0;">This is an automated acknowledgement — just reply to this email to add anything more.</p>
+    </div>
+  </div>
+</div>`;
+            await transporter.sendMail({
+                from: `"RESCUEN Support" <${supportUser}>`,
+                to: email,
+                subject: 'We received your message — RESCUEN Support',
+                text: `Hi ${name},\n\nThank you for contacting RESCUEN. We've received your message and our team will review it and get back to you within 1–2 working days.\n\nYOUR MESSAGE\n-----------\n${message}\n\n⚠️ If you are in immediate danger, please use the SOS button in the app or call your local emergency number right away — do not wait for this email reply.\n\nStay safe,\nTeam RESCUEN`,
+                html,
+                attachments: [{
+                    filename: 'rescuen-logo.png',
+                    path: path.join(__dirname, 'assets', 'logo.png'),
+                    cid: 'rescuenlogo',
+                }],
+            });
+        } catch (e) { console.error('Auto-reply failed:', e); /* best-effort */ }
         return { success: true };
     } catch (error) {
         console.error("Email Sending Error:", error);

@@ -67,3 +67,15 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+# Build cache & outputs (do NOT commit — huge and machine-specific)
+buildtmp/
+*.apk
+*.aab
+*.keystore
+keystore.properties
+WomenSafetyApp/android/app/build/
+WomenSafetyApp/android/build/
+WomenSafetyApp/android/.gradle/
+WomenSafetyApp/android/.cxx/
+*.hprof

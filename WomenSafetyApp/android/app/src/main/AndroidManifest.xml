@@ -11,9 +11,15 @@
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
-    
+
+    <!-- Evidence capture: audio recording + camera (were missing, so audio evidence never worked) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
@@ -50,9 +56,9 @@
         </intent-filter>
       </activity>
 
-      <service 
-        android:name="app.notifee.core.ForegroundService" 
-        android:foregroundServiceType="location" 
+      <service
+        android:name="app.notifee.core.ForegroundService"
+        android:foregroundServiceType="location|microphone|camera"
         android:exported="false" />
 
       <meta-data

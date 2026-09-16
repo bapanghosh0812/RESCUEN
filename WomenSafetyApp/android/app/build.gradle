@@ -31,8 +31,8 @@ android {
         applicationId "com.officialrescuen.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 23
-        versionName "23.0"
+        versionCode 27
+        versionName "2.26.35.88"
     }
     signingConfigs {
         debug {

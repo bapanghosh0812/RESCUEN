@@ -1,4 +1,4 @@
-import notifee, { TriggerType, RepeatFrequency, AndroidImportance } from '@notifee/react-native';
+import notifee, { TriggerType, RepeatFrequency, AndroidImportance, EventType } from '@notifee/react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Linking } from 'react-native';
 
@@ -100,14 +100,8 @@ class NotificationManager {
 
   // 3. Notification pe click karne ka action (Direct Play Store)
   static setupNotificationListeners() {
-    notifee.onBackgroundEvent(async ({ type, detail }) => {
-      if (type === notifee.EventType.PRESS && detail.notification.data?.type === 'review') {
-        Linking.openURL('https://play.google.com/store/apps/details?id=com.officialrescuen.app');
-      }
-    });
-
     notifee.onForegroundEvent(({ type, detail }) => {
-      if (type === notifee.EventType.PRESS && detail.notification.data?.type === 'review') {
+      if (type === EventType.PRESS && detail.notification?.data?.type === 'review') {
         Linking.openURL('https://play.google.com/store/apps/details?id=com.officialrescuen.app');
       }
     });
